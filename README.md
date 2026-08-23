@@ -1,33 +1,29 @@
 # DubStudio
 
-Local-first AI dubbing studio. Upload a video, get a dubbed MP4 plus SRT — speech translated and cloned per speaker, original music/SFX kept.
+Local-first AI dubbing studio. Upload a video → extract → transcribe → translate → synthesize → fit timing → mix over bed → remux MP4 + SRT.
 
-**Phase 0 is in this commit:** API + job state machine + upload UI. Pipeline stages are named correctly but stubbed. No Whisper / Demucs / TTS yet.
+**Phase 1 locked:** full pipeline runs end-to-end. WhisperX / Chatterbox / Demucs plug in when installed; CI uses mock ASR + DummyEngine so tests pass without a GPU.
 
-## Run Phase 0
+## Quick start
 
 ```bash
-python3.11 -m venv .venv
-source .venv/bin/activate
+python3.11 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 cp .env.example .env
+make test
 make api
 ```
 
-In another terminal:
+UI: `cd web && npm install && npm run dev` → http://127.0.0.1:5173
+
+## Tests
 
 ```bash
-cd web && npm install && npm run dev
+make test
 ```
 
-Open http://127.0.0.1:5173 — drop any file, watch the 12 stages walk to `completed`.
-
-`GET http://127.0.0.1:8080/api/v1/health`
+9 tests: state machine, ffmpeg extract/remux, segments, timing, full e2e fixture → MP4+SRT.
 
 ## Spec
 
-Read `docs/spec/` first. Default TTS is **Chatterbox** behind `VoiceEngine`.
-
-## Stack
-
-Python 3.11 · FastAPI · SQLite · React/Vite · FFmpeg · WhisperX · Demucs · Ollama · Chatterbox
+`docs/LOCK.md` and `docs/spec/`.
