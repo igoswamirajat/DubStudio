@@ -1,0 +1,11 @@
+:root { color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; }
+body { margin: 0; background: #0f1115; color: #ececec; }
+main { max-width: 720px; margin: 48px auto; padding: 0 20px; }
+h1 { font-weight: 650; letter-spacing: -0.03em; }
+.card { background: #181b22; border: 1px solid #2a2f3a; border-radius: 14px; padding: 20px; }
+label { display: block; margin: 12px 0 6px; font-size: 13px; color: #9aa3b2; }
+select, input[type=file], button { font: inherit; }
+button { background: #5b8cff; color: #08101f; border: 0; border-radius: 10px; padding: 10px 16px; font-weight: 650; cursor: pointer; }
+.bar { height: 8px; background: #2a2f3a; border-radius: 99px; overflow: hidden; margin: 12px 0; }
+.bar > i { display: block; height: 100%; background: #5b8cff; }
+.muted { color: #9aa3b2; font-size: 13px; }
