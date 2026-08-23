@@ -29,7 +29,12 @@ class JobStore:
         settings.data_dir.mkdir(parents=True, exist_ok=True)
         settings.jobs_dir.mkdir(parents=True, exist_ok=True)
         path = db_path or settings.db_path
-        self.engine = create_engine(f"sqlite:///{path}", echo=False)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.engine = create_engine(
+            f"sqlite:///{path}",
+            echo=False,
+            connect_args={"timeout": 30, "check_same_thread": False},
+        )
         Base.metadata.create_all(self.engine)
 
     def create(self, job: dict[str, Any]) -> dict[str, Any]:
