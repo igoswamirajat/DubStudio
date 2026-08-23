@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+import traceback
 
-from dubstudio.jobs.states import PIPELINE_STAGES, require_transition
+from dubstudio.jobs.states import require_transition
 from dubstudio.jobs.store import store
+from dubstudio.pipeline.orchestrator import run_job
+from dubstudio.settings import settings
 
 log = logging.getLogger("dubstudio.runner")
 _gpu_lock = asyncio.Lock()
@@ -27,7 +29,7 @@ async def enqueue(job_id: str) -> None:
 async def _run(job_id: str) -> None:
     async with _gpu_lock:
         try:
-            await _pipeline(job_id)
+            await asyncio.to_thread(run_job, job_id)
         except asyncio.CancelledError:
             job = store.get(job_id)
             if job and job["state"] not in {"completed", "failed"}:
@@ -40,35 +42,10 @@ async def _run(job_id: str) -> None:
             job["error"] = str(exc)
             job["message"] = "Failed"
             store.save(job)
+            log_path = settings.jobs_dir / job_id / "logs" / "pipeline.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(traceback.format_exc(), encoding="utf-8")
             log.exception("job %s failed", job_id)
-
-
-async def _pipeline(job_id: str) -> None:
-    job = store.get(job_id)
-    assert job
-    require_transition(job["state"], "ingesting")
-    total = len(PIPELINE_STAGES)
-    for i, stage in enumerate(PIPELINE_STAGES, start=1):
-        job = store.get(job_id)
-        assert job
-        if job["state"] == "canceled":
-            return
-        require_transition(job["state"] if i == 1 else PIPELINE_STAGES[i - 2], stage)
-        job["state"] = stage
-        job["stage_index"] = i
-        job["stage_total"] = total
-        job["percent"] = int(i / total * 95)
-        job["message"] = f"{stage.replace('_', ' ').title()} (phase 0 stub)"
-        store.save(job)
-        await asyncio.sleep(0.35)
-    job = store.get(job_id)
-    assert job
-    require_transition(job["state"], "completed")
-    job["state"] = "completed"
-    job["percent"] = 100
-    job["message"] = "Completed (phase 0 stub — no media processed yet)"
-    job["updated_at"] = datetime.now(timezone.utc).isoformat()
-    store.save(job)
 
 
 async def cancel(job_id: str) -> None:
