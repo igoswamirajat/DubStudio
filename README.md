@@ -1,8 +1,22 @@
 # DubStudio
 
-Local-first AI dubbing studio. Upload a video → extract → transcribe → translate → synthesize → fit timing → mix over bed → remux MP4 + SRT.
+**Local-first AI video dubbing studio**
 
-**Phase 1 locked:** full pipeline runs end-to-end. WhisperX / Chatterbox / Demucs plug in when installed; CI uses mock ASR + DummyEngine so tests pass without a GPU.
+Upload a video → keep the original music & SFX → replace only the spoken dialogue with cloned (or new) voices in any language → download polished dubbed MP4 + SRT.
+
+## Locked decisions
+
+- **Primary TTS + Voice Cloning:** OmniVoice
+- **Fallback (CI / no GPU):** DummyEngine
+- **BGM + SFX:** Always preserved (Demucs → bed track + light ducking)
+- **ASR:** WhisperX (mock fallback)
+- **Media:** FFmpeg
+- **UI:** Clean, simple, beautiful — speaker cards + one-click dub
+
+See:
+- `docs/LOCK.md` — hard decisions
+- `docs/PRODUCT.md` — product brief
+- `docs/FINAL_PLAN.md` — full compiled plan + phases
 
 ## Quick start
 
@@ -10,20 +24,55 @@ Local-first AI dubbing studio. Upload a video → extract → transcribe → tra
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 cp .env.example .env
-make test
-make api
+make test          # must pass
+make api           # http://127.0.0.1:8080/api/v1/health
 ```
 
-UI: `cd web && npm install && npm run dev` → http://127.0.0.1:5173
+UI (other terminal):
 
-## Tests
+```bash
+cd web && npm install && npm run dev
+```
+
+## Tests (run after every build)
 
 ```bash
 make test
 ```
 
-9 tests: state machine, ffmpeg extract/remux, segments, timing, full e2e fixture → MP4+SRT.
+## Engines
 
-## Spec
+| Stage | Primary | Fallback |
+|---|---|---|
+| TTS + Cloning | **OmniVoice** | DummyEngine |
+| Optional later | Veena (Hindi), Chatterbox | — |
+| ASR | WhisperX | Mock |
+| Separation | Demucs | Copy full mix (Phase 1) |
+| Translate | Ollama | Demo map |
 
-`docs/LOCK.md` and `docs/spec/`.
+```bash
+# Force engines
+export DUBSTUDIO_TTS_ENGINE=omnivoice   # or dummy
+export DUBSTUDIO_TRANSLATOR=demo
+```
+
+## Pipeline (locked)
+
+1. Upload
+2. FFmpeg extract
+3. Demucs → vocals + bed (music/SFX)
+4. WhisperX transcription + diarization
+5. Translate
+6. Voice enroll / clone (OmniVoice)
+7. Synthesize
+8. Time-correct
+9. Mix dialogue over bed
+10. Export MP4 + SRT
+
+## Stack
+
+Python 3.11+ · FastAPI · SQLite · React/Vite · FFmpeg · WhisperX · Demucs · OmniVoice · Ollama
+
+## Agent rule
+
+After every module: run tests. Only green builds are accepted.
