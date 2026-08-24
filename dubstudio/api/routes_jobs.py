@@ -25,6 +25,7 @@ async def create_job(
     target_language: str = Form("hi"),
     source_language: str = Form(""),
     skip_separation: str = Form("false"),
+    tts_engine: str = Form(""),
 ):
     job_id = _new_id()
     job_dir = settings.jobs_dir / job_id / "source"
@@ -37,6 +38,7 @@ async def create_job(
         if len(data) > max_bytes:
             raise HTTPException(413, "file too large")
         dest.write_bytes(data)
+    engine = (tts_engine or settings.tts_engine or "omnivoice").strip().lower()
     job = {
         "job_id": job_id,
         "state": "created",
@@ -45,6 +47,7 @@ async def create_job(
         "source_filename": filename,
         "source_language": source_language or None,
         "target_language": target_language,
+        "tts_engine": engine,
         "skip_separation": skip_separation.lower() == "true",
         "percent": 0,
         "stage_index": 0,
@@ -56,7 +59,7 @@ async def create_job(
     }
     store.create(job)
     await enqueue(job_id)
-    return JSONResponse({"job_id": job_id, "state": "queued"}, status_code=201)
+    return JSONResponse({"job_id": job_id, "state": "queued", "tts_engine": engine}, status_code=201)
 
 
 @router.get("/jobs")
