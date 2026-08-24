@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8080
     whisper_model: str = "large-v3-turbo"
-    tts_engine: str = "chatterbox"
+    tts_engine: str = "omnivoice"
     translator: str = "ollama"
     ollama_host: str = "http://127.0.0.1:11434"
     ollama_model: str = "qwen2.5:14b"
