@@ -6,16 +6,37 @@ from dubstudio.settings import settings
 
 
 def get_voice_engine(name: str | None = None) -> VoiceEngine:
-    name = (name or settings.tts_engine or "dummy").lower()
+    """Return the requested voice engine, falling back to DummyEngine.
+
+    Primary: OmniVoice
+    Optional: Chatterbox
+    Always-safe: DummyEngine
+    """
+    name = (name or settings.tts_engine or "omnivoice").lower().strip()
+
+    # --- OmniVoice (primary) ---
+    if name in {"omnivoice", "omni", "omni_voice"}:
+        try:
+            from dubstudio.engines.omnivoice_engine import OmniVoiceEngine
+
+            eng = OmniVoiceEngine()
+            eng.warmup()
+            return eng
+        except Exception:
+            pass  # fall through to dummy
+
+    # --- Chatterbox (optional) ---
     if name in {"chatterbox", "xtts"}:
         try:
-            if name == "chatterbox":
-                from dubstudio.engines.chatterbox_engine import ChatterboxEngine
-                eng = ChatterboxEngine()
-                eng.warmup()
-                return eng
+            from dubstudio.engines.chatterbox_engine import ChatterboxEngine
+
+            eng = ChatterboxEngine()
+            eng.warmup()
+            return eng
         except Exception:
             pass
+
+    # --- Explicit dummy or final safety net ---
     eng = DummyEngine()
     eng.warmup()
     return eng
