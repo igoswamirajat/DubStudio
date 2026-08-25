@@ -33,7 +33,7 @@ PIPELINE_STAGES = [
     "exporting",
 ]
 
-ALLOWED = {
+_FORWARD = {
     "created": {"queued"},
     "queued": {"ingesting"},
     "ingesting": {"extracting", "failed"},
@@ -50,6 +50,15 @@ ALLOWED = {
     "exporting": {"completed", "failed"},
     "failed": {"queued"},
 }
+
+ALLOWED: dict[str, set[str]] = {k: set(v) for k, v in _FORWARD.items()}
+
+_order = ["queued"] + PIPELINE_STAGES + ["completed"]
+for i, s in enumerate(_order):
+    ALLOWED.setdefault(s, set())
+    for later in _order[i + 1 :]:
+        ALLOWED[s].add(later)
+    ALLOWED[s].add("failed")
 
 NON_TERMINAL = set(STATES) - {"completed", "failed", "canceled"}
 for s in NON_TERMINAL:
