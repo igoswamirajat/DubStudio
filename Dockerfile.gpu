@@ -1,0 +1,36 @@
+# GPU image with OmniVoice + Demucs (NVIDIA) — large; first run downloads weights
+FROM node:22-bookworm-slim AS web
+WORKDIR /web
+COPY web/package.json web/package-lock.json* ./
+RUN npm install --prefer-offline --no-audit --no-fund
+COPY web/ ./
+RUN npm run build
+
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    DUBSTUDIO_TTS_ENGINE=omnivoice \
+    DUBSTUDIO_TRANSLATOR=demo \
+    DUBSTUDIO_SKIP_SEPARATION=0 \
+    DUBSTUDIO_HOST=0.0.0.0 \
+    DUBSTUDIO_PORT=8080 \
+    DATA_DIR=/data \
+    HF_HOME=/data/hf
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ffmpeg libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY dubstudio ./dubstudio
+COPY scripts ./scripts
+RUN pip install --no-cache-dir -e . \
+ && pip install --no-cache-dir omnivoice demucs || pip install --no-cache-dir demucs
+
+COPY --from=web /web/dist ./web/dist
+RUN mkdir -p /data/jobs /data/hf
+VOLUME ["/data"]
+EXPOSE 8080
+CMD ["uvicorn", "dubstudio.main:app", "--host", "0.0.0.0", "--port", "8080"]

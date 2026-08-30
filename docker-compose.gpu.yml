@@ -1,0 +1,22 @@
+# GPU + OmniVoice (optional)
+# Requires NVIDIA Container Toolkit
+# docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+
+services:
+  dubstudio:
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    image: dubstudio:gpu
+    environment:
+      DUBSTUDIO_TTS_ENGINE: omnivoice
+      DUBSTUDIO_SKIP_SEPARATION: "0"
+      DUBSTUDIO_TRANSLATOR: demo
+      NVIDIA_VISIBLE_DEVICES: all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
