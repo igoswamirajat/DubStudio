@@ -1,0 +1,22 @@
+# Simple: one container, UI + API on :8080
+# Usage:
+#   docker compose up --build
+#   open http://localhost:8080
+
+services:
+  dubstudio:
+    build: .
+    image: dubstudio:local
+    ports:
+      - "8080:8080"
+    volumes:
+      - dubstudio_data:/data
+    environment:
+      DUBSTUDIO_TTS_ENGINE: ${DUBSTUDIO_TTS_ENGINE:-dummy}
+      DUBSTUDIO_TRANSLATOR: ${DUBSTUDIO_TRANSLATOR:-demo}
+      DUBSTUDIO_SKIP_SEPARATION: ${DUBSTUDIO_SKIP_SEPARATION:-1}
+      DATA_DIR: /data
+    restart: unless-stopped
+
+volumes:
+  dubstudio_data:
