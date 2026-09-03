@@ -42,6 +42,37 @@ pip install omnivoice demucs
 $env:DUBSTUDIO_TTS_ENGINE="omnivoice"
 ```
 
+## Full local pipeline (GPU)
+
+Turns every stage real: Demucs separation, faster-whisper ASR, pyannote
+diarization, Ollama translation, OmniVoice TTS.
+
+```powershell
+# 1. Install all model deps into the venv
+pip install -e ".[full]"
+
+# 2. Translation — install Ollama and pull a model
+#    https://ollama.com/download
+ollama pull qwen2.5:7b
+
+# 3. Diarization — needs a HuggingFace token AND accepting the model terms:
+#    https://huggingface.co/pyannote/speaker-diarization-3.1
+#    then set it (also read as HF_TOKEN):
+$env:DUBSTUDIO_HF_TOKEN="hf_xxx"
+```
+
+Copy `.env.example` to `.env` to configure engines/models. Defaults already
+select the real engines; the first run downloads the Whisper / OmniVoice /
+Demucs / pyannote models (several GB). Check `/api/v1/health` to confirm what is
+active (GPU, ASR, diarization, TTS, translator).
+
+`GET /api/v1/health` reports each subsystem, e.g.:
+
+```json
+{"ok": true, "ffmpeg": true, "gpu": true, "asr": "faster-whisper",
+ "diarization": "installed", "tts": "omnivoice", "translator": "ollama"}
+```
+
 ## Tests
 
 ```bash

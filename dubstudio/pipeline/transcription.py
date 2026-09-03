@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
+
+from dubstudio.settings import settings
+
+log = logging.getLogger("dubstudio.transcription")
 
 
 def _mock_words(duration_s: float) -> list[dict[str, Any]]:
@@ -30,7 +35,65 @@ def _mock_words(duration_s: float) -> list[dict[str, Any]]:
     return words
 
 
-def run_transcription(job_dir: Path, *, model: str = "large-v3-turbo") -> dict:
+def _resolve_device_compute() -> tuple[str, str]:
+    device = settings.whisper_device
+    compute = settings.whisper_compute_type
+    if device == "auto":
+        try:
+            import torch
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            device = "cpu"
+    if compute == "auto":
+        compute = "float16" if device == "cuda" else "int8"
+    return device, compute
+
+
+def _faster_whisper_words(vocals: Path, model_name: str) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+    from faster_whisper import WhisperModel
+
+    device, compute = _resolve_device_compute()
+    log.info("Loading faster-whisper %s on %s (%s)", model_name, device, compute)
+    model = WhisperModel(model_name, device=device, compute_type=compute)
+    segments, info = model.transcribe(
+        str(vocals),
+        word_timestamps=True,
+        vad_filter=True,
+        beam_size=5,
+    )
+    words: list[dict[str, Any]] = []
+    seg_dump: list[dict[str, Any]] = []
+    for seg in segments:
+        seg_dump.append({"start": seg.start, "end": seg.end, "text": seg.text})
+        if seg.words:
+            for w in seg.words:
+                token = (w.word or "").strip()
+                if not token:
+                    continue
+                words.append({
+                    "word": token,
+                    "start": round(float(w.start), 3),
+                    "end": round(float(w.end), 3),
+                    "score": round(float(w.probability or 1.0), 4),
+                    "speaker": "S00",
+                })
+        elif seg.text.strip():
+            toks = seg.text.strip().split()
+            s0, s1 = float(seg.start), float(seg.end)
+            step = (s1 - s0) / max(1, len(toks))
+            for i, tok in enumerate(toks):
+                words.append({"word": tok, "start": round(s0 + i * step, 3), "end": round(s0 + (i + 1) * step, 3), "score": 0.9, "speaker": "S00"})
+    raw = {
+        "language": info.language,
+        "language_probability": getattr(info, "language_probability", None),
+        "duration": getattr(info, "duration", None),
+        "segments": seg_dump,
+    }
+    return info.language or "en", words, raw
+
+
+def run_transcription(job_dir: Path, *, model: str | None = None) -> dict:
     asr_dir = job_dir / "asr"
     asr_dir.mkdir(parents=True, exist_ok=True)
     vocals = job_dir / "audio" / "vocals.wav"
@@ -38,54 +101,39 @@ def run_transcription(job_dir: Path, *, model: str = "large-v3-turbo") -> dict:
         vocals = job_dir / "audio" / "full.wav"
     if not vocals.exists():
         raise FileNotFoundError("no audio for transcription")
-    duration_s = 0.0
+
+    duration_s = 8.0
     try:
         import soundfile as sf
+
         duration_s = float(sf.info(str(vocals)).duration)
     except Exception:
-        duration_s = 8.0
+        pass
+
+    model_name = model or settings.whisper_model
     engine = "mock"
+    language = "en"
     words: list[dict[str, Any]] = []
     raw: dict[str, Any] = {}
-    try:
-        import whisperx  # type: ignore
-        device = "cpu"
+
+    if settings.asr_engine != "mock":
         try:
-            import torch
-            if torch.cuda.is_available():
-                device = "cuda"
-        except Exception:
-            pass
-        audio = whisperx.load_audio(str(vocals))
-        model_obj = whisperx.load_model(model, device, compute_type="int8")
-        result = model_obj.transcribe(audio, batch_size=8)
-        language = result.get("language", "en")
-        try:
-            align_model, metadata = whisperx.load_align_model(language_code=language, device=device)
-            result = whisperx.align(result["segments"], align_model, metadata, audio, device)
-        except Exception:
-            pass
-        for seg in result.get("segments", []):
-            sp = seg.get("speaker", "S00")
-            for w in seg.get("words", []) or []:
-                if "word" not in w and "text" in w:
-                    w = {**w, "word": w["text"]}
-                if not w.get("word"):
-                    continue
-                words.append({"word": str(w["word"]).strip(), "start": float(w.get("start", seg.get("start", 0))), "end": float(w.get("end", seg.get("end", 0))), "score": float(w.get("score", 1.0) or 1.0), "speaker": sp})
-            if not seg.get("words") and seg.get("text"):
-                text = seg["text"].strip().split()
-                s0, s1 = float(seg["start"]), float(seg["end"])
-                step = (s1 - s0) / max(1, len(text))
-                for i, tok in enumerate(text):
-                    words.append({"word": tok, "start": s0 + i * step, "end": s0 + (i + 1) * step, "score": 0.9, "speaker": sp})
-        engine = "whisperx"
-        raw = {"language": language, "segments": result.get("segments", [])}
-    except Exception as exc:
+            language, words, raw = _faster_whisper_words(vocals, model_name)
+            engine = "faster-whisper"
+            if not words:
+                log.warning("faster-whisper returned no words; falling back to mock")
+                engine = "mock"
+                words = _mock_words(duration_s)
+                raw = {"engine": "mock", "reason": "empty_transcription", "duration_s": duration_s}
+        except Exception as exc:
+            log.exception("faster-whisper failed, using mock words")
+            words = _mock_words(duration_s)
+            raw = {"engine": "mock", "error": str(exc), "duration_s": duration_s}
+    else:
         words = _mock_words(duration_s)
-        raw = {"engine": "mock", "error": str(exc), "duration_s": duration_s}
-    language = raw.get("language") or "en"
+        raw = {"engine": "mock", "duration_s": duration_s}
+
     transcript = {"engine": engine, "language": language, "duration_s": duration_s, "words": words}
-    (asr_dir / "whisperx.json").write_text(json.dumps(raw, indent=2, default=str), encoding="utf-8")
-    (asr_dir / "transcript.json").write_text(json.dumps(transcript, indent=2), encoding="utf-8")
+    (asr_dir / "whisper.json").write_text(json.dumps(raw, indent=2, default=str, ensure_ascii=False), encoding="utf-8")
+    (asr_dir / "transcript.json").write_text(json.dumps(transcript, indent=2, ensure_ascii=False), encoding="utf-8")
     return transcript

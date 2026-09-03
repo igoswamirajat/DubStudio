@@ -49,6 +49,7 @@ _FORWARD = {
     "mixing": {"exporting", "failed"},
     "exporting": {"completed", "failed"},
     "failed": {"queued"},
+    "canceled": {"queued"},
 }
 
 ALLOWED: dict[str, set[str]] = {k: set(v) for k, v in _FORWARD.items()}

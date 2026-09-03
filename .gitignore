@@ -6,6 +6,8 @@ data/jobs/
 data/*.db
 .env
 web/dist/
+*.egg-info/
+.pytest_cache/
 *.wav
 *.mp4
 !tests/fixtures/.gitkeep

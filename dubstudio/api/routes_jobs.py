@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import shutil
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
@@ -33,11 +35,22 @@ async def create_job(
     filename = file.filename if file and file.filename else "none.bin"
     dest = job_dir / (filename or "upload.bin")
     if file is not None:
-        data = await file.read()
         max_bytes = settings.max_upload_mb * 1024 * 1024
-        if len(data) > max_bytes:
-            raise HTTPException(413, "file too large")
-        dest.write_bytes(data)
+        written = 0
+        try:
+            with dest.open("wb") as out:
+                while True:
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > max_bytes:
+                        out.close()
+                        dest.unlink(missing_ok=True)
+                        raise HTTPException(413, f"file too large (>{settings.max_upload_mb} MB)")
+                    out.write(chunk)
+        finally:
+            await file.close()
     engine = (tts_engine or settings.tts_engine or "omnivoice").strip().lower()
     job = {
         "job_id": job_id,
@@ -80,9 +93,22 @@ def get_segments(job_id: str):
     path = settings.jobs_dir / job_id / "segments" / "segments.json"
     if not path.exists():
         return {"segments": []}
-    import json
 
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+@router.delete("/jobs/{job_id}")
+async def delete_job(job_id: str):
+    job = store.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    if job.get("state") not in {"completed", "failed", "canceled", "created"}:
+        await cancel(job_id)
+    store.delete(job_id)
+    job_dir = settings.jobs_dir / job_id
+    if job_dir.is_dir():
+        shutil.rmtree(job_dir, ignore_errors=True)
+    return {"ok": True, "deleted": job_id}
 
 
 @router.post("/jobs/{job_id}/cancel")
@@ -110,6 +136,26 @@ def download(job_id: str, artifact: str = "json"):
     return FileResponse(path)
 
 
+@router.get("/jobs/{job_id}/media/{kind}")
+def media(job_id: str, kind: str):
+    """Serve source or dubbed video inline for in-browser preview."""
+    job = store.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    base = settings.jobs_dir / job_id
+    if kind == "output":
+        path = base / "export" / "output.mp4"
+    elif kind == "source":
+        src_dir = base / "source"
+        cands = [p for p in src_dir.glob("*") if p.is_file() and p.name != "meta.json"] if src_dir.is_dir() else []
+        path = cands[0] if cands else None
+    else:
+        raise HTTPException(400, "kind must be source or output")
+    if not path or not path.exists():
+        raise HTTPException(404, "media not ready")
+    return FileResponse(path, media_type="video/mp4", content_disposition_type="inline")
+
+
 @router.get("/jobs/{job_id}/events")
 async def events(job_id: str):
     if not store.get(job_id):
@@ -129,7 +175,7 @@ async def events(job_id: str):
                     kind = "done"
                 elif job["state"] == "failed":
                     kind = "error"
-                yield {"event": kind, "data": str(job)}
+                yield {"event": kind, "data": json.dumps(job, default=str)}
                 if kind in {"done", "error"}:
                     break
             await asyncio.sleep(0.25)

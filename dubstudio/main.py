@@ -9,6 +9,7 @@ from dubstudio.api.routes_health import router as health_router
 from dubstudio.api.routes_jobs import router as jobs_router
 from dubstudio.api.routes_speakers import router as speakers_router
 from dubstudio.api.routes_segments import router as segments_router
+from dubstudio.api.routes_settings import router as settings_router
 from dubstudio.settings import settings
 
 _RESERVED = {"api", "docs", "redoc", "openapi.json", "assets"}
@@ -17,10 +18,21 @@ _RESERVED = {"api", "docs", "redoc", "openapi.json", "assets"}
 def create_app() -> FastAPI:
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.jobs_dir.mkdir(parents=True, exist_ok=True)
+    # Route model caches to a configured location before any ML lib loads.
+    if settings.hf_home:
+        import os
+
+        os.environ.setdefault("HF_HOME", settings.hf_home)
+        os.environ["HF_HOME"] = settings.hf_home
+    from dubstudio.jobs.store import store
+
+    store.recover_interrupted()
     app = FastAPI(title="DubStudio", version="0.9.0")
+    # Local-first single-user: same-origin UI is served by this app, so CORS is
+    # only needed for the Vite dev server. Restrict to loopback origins.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origin_regex=r"^http://(localhost|127\.0\.0\.1)(:\d+)?$",
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -28,6 +40,7 @@ def create_app() -> FastAPI:
     app.include_router(jobs_router, prefix="/api/v1")
     app.include_router(speakers_router, prefix="/api/v1")
     app.include_router(segments_router, prefix="/api/v1")
+    app.include_router(settings_router, prefix="/api/v1")
 
     dist = Path(__file__).resolve().parent.parent / "web" / "dist"
     if dist.is_dir() and (dist / "index.html").exists():

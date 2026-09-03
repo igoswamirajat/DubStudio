@@ -140,16 +140,13 @@ def resynth_segment(job_id: str, segment_id: str, body: ResynthBody | None = Non
 
 
 @router.post("/jobs/{job_id}/resume")
-def resume_job(job_id: str):
-    from dubstudio.pipeline.orchestrator import run_job
+async def resume_job(job_id: str):
+    from dubstudio.jobs.runner import enqueue
 
     job = store.get(job_id)
     if not job:
         raise HTTPException(404, "job not found")
     if job["state"] == "completed":
         return {"ok": True, "message": "already completed"}
-    job["state"] = "queued"
-    job["message"] = "Resuming from checkpoint"
-    store.save(job)
-    result = run_job(job_id)
-    return {"ok": True, "job_id": job_id, "state": result.get("state")}
+    await enqueue(job_id)
+    return {"ok": True, "job_id": job_id, "state": "queued"}

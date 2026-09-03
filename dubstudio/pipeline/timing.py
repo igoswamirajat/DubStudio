@@ -22,7 +22,7 @@ def _atempo_chain(ratio: float) -> list[str]:
     return factors
 
 
-def fit_segment(src: Path, dest: Path, target_ms: int, *, max_stretch: float = 0.12) -> dict:
+def fit_segment(src: Path, dest: Path, target_ms: int, *, max_stretch: float = 0.25) -> dict:
     gen_ms = duration_ms(src)
     if gen_ms <= 0:
         shutil.copy2(src, dest)
@@ -30,7 +30,9 @@ def fit_segment(src: Path, dest: Path, target_ms: int, *, max_stretch: float = 0
     target_ms = max(1, target_ms)
     ratio = gen_ms / target_ms
     lo, hi = 1.0 - max_stretch, 1.0 + max_stretch
-    if 0.92 <= ratio <= 1.08:
+    # Small no-touch zone: only skip fitting when already very close, so short
+    # dubs get slowed to fill the slot (no silent gaps) and long ones sped up.
+    if 0.95 <= ratio <= 1.05:
         shutil.copy2(src, dest)
         return {"stretch_ratio": 1.0, "generated_duration_ms": gen_ms, "fitted_duration_ms": gen_ms, "status": "ok"}
     applied = max(lo, min(hi, ratio))

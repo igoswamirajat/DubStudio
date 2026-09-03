@@ -11,6 +11,10 @@ def get_voice_engine(name: str | None = None) -> VoiceEngine:
     Primary: OmniVoice
     Optional: Chatterbox
     Always-safe: DummyEngine
+
+    Engines are constructed but NOT warmed up here — model loading happens
+    lazily on the first generate() call, so this stays cheap for availability
+    checks and callers that only need the engine name.
     """
     name = (name or settings.tts_engine or "omnivoice").lower().strip()
 
@@ -19,9 +23,7 @@ def get_voice_engine(name: str | None = None) -> VoiceEngine:
         try:
             from dubstudio.engines.omnivoice_engine import OmniVoiceEngine
 
-            eng = OmniVoiceEngine()
-            eng.warmup()
-            return eng
+            return OmniVoiceEngine()
         except Exception:
             pass  # fall through to dummy
 
@@ -30,13 +32,9 @@ def get_voice_engine(name: str | None = None) -> VoiceEngine:
         try:
             from dubstudio.engines.chatterbox_engine import ChatterboxEngine
 
-            eng = ChatterboxEngine()
-            eng.warmup()
-            return eng
+            return ChatterboxEngine()
         except Exception:
             pass
 
     # --- Explicit dummy or final safety net ---
-    eng = DummyEngine()
-    eng.warmup()
-    return eng
+    return DummyEngine()

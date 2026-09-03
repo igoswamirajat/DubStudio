@@ -29,20 +29,23 @@ def test_skip_copy_produces_vocals_and_bed(tmp_path: Path):
     assert Path(result["bed"]).stat().st_size == full.stat().st_size
 
 
-def test_no_skip_without_demucs_still_produces_bed(tmp_path: Path):
+def test_no_skip_falls_back_when_demucs_errors(tmp_path: Path, monkeypatch):
+    import subprocess as _sp
+
+    import dubstudio.pipeline.separation as sep
+
     audio = tmp_path / "audio"
     full = audio / "full.wav"
     _write_dummy_wav(full, 0.5)
+
+    def _boom(*a, **k):
+        raise _sp.CalledProcessError(1, a[0] if a else "demucs", output=b"forced")
+
+    monkeypatch.setattr(sep.subprocess, "run", _boom)
     result = run_separation(tmp_path, skip=False)
-    assert "bed" in result
+    assert result["mode"] == "fallback_copy"
     assert Path(result["bed"]).exists()
     assert Path(result["vocals"]).exists()
-    assert result["mode"] in {
-        "fallback_copy_no_demucs",
-        "fallback_copy_demucs_error",
-        "demucs_htdemucs_ft",
-        "fallback_copy",
-    }
 
 
 def test_missing_full_raises(tmp_path: Path):

@@ -14,6 +14,8 @@ def test_full_pipeline_produces_mp4_and_srt(clip_8s, job_workspace, monkeypatch)
     monkeypatch.setattr(settings, "tts_engine", "dummy")
     monkeypatch.setattr(settings, "translator", "demo")
     monkeypatch.setattr(settings, "skip_separation", True)
+    monkeypatch.setattr(settings, "asr_engine", "mock")
+    monkeypatch.setattr(settings, "enable_diarization", False)
     job_id = f"job_test_e2e_{uuid.uuid4().hex[:10]}"
     job_dir = settings.jobs_dir / job_id
     src_dir = job_dir / "source"

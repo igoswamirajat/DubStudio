@@ -70,6 +70,35 @@ class JobStore:
         self._write_snapshot(job)
         return job
 
+    def delete(self, job_id: str) -> bool:
+        with Session(self.engine) as s:
+            row = s.get(JobRow, job_id)
+            if row is None:
+                return False
+            s.delete(row)
+            s.commit()
+        return True
+
+    def recover_interrupted(self) -> int:
+        """Mark jobs left mid-flight by a previous process as failed.
+
+        In-flight tasks live only in memory, so any non-terminal job found at
+        startup was interrupted and can never resume on its own.
+        """
+        terminal = {"completed", "failed", "canceled", "created"}
+        recovered = 0
+        for job in self.list(limit=1000):
+            if job.get("state") not in terminal:
+                job["state"] = "failed"
+                job["error"] = "interrupted by server restart"
+                job["message"] = "Interrupted (server restarted)"
+                try:
+                    self.save(job)
+                    recovered += 1
+                except KeyError:
+                    pass
+        return recovered
+
     def _write_snapshot(self, job: dict[str, Any]) -> None:
         d = settings.jobs_dir / job["job_id"]
         d.mkdir(parents=True, exist_ok=True)
