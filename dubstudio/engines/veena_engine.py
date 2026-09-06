@@ -98,11 +98,28 @@ class VeenaEngine(VoiceEngine):
             pass
         return "cpu"
 
+    def _resolve_snapshot_dir(self) -> Path | None:
+        """Find local Hugging Face snapshot directory if model was downloaded."""
+        try:
+            from dubstudio.api.routes_models import _get_active_storage_dir
+            base = _get_active_storage_dir() / "hub"
+            repo_slug = f"models--{self.model_id.replace('/', '--')}"
+            snap_base = base / repo_slug / "snapshots"
+            if snap_base.is_dir():
+                for sub in snap_base.iterdir():
+                    if sub.is_dir():
+                        return sub
+        except Exception:
+            pass
+        return None
+
     def warmup(self) -> None:
         if self._model is not None:
             return
 
         import gc
+        import glob
+        import os
         import torch
 
         gc.collect()
@@ -114,48 +131,96 @@ class VeenaEngine(VoiceEngine):
 
         log.info("Loading Veena (%s) on %s", self.model_id, device)
 
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        snap_dir = self._resolve_snapshot_dir()
+        model_path = str(snap_dir) if snap_dir else self.model_id
 
-        quant_config = None
+        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+        self._tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
         if is_cuda and self.load_in_4bit:
             try:
-                import bitsandbytes  # noqa: F401
+                import bitsandbytes as bnb
                 from transformers import BitsAndBytesConfig
+                from transformers.integrations.bitsandbytes import replace_with_bnb_linear
+                from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+                import safetensors.torch
 
-                quant_config = BitsAndBytesConfig(
+                config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+                quant = BitsAndBytesConfig(
                     load_in_4bit=True,
                     bnb_4bit_quant_type="nf4",
-                    bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                )
+                with torch.device("meta"):
+                    model = AutoModelForCausalLM.from_config(config)
+                replace_with_bnb_linear(model, quantization_config=quant)
+
+                # lm_head stays standard Linear sharing weights with embed_tokens
+                model.lm_head = torch.nn.Linear(
+                    config.hidden_size,
+                    config.vocab_size,
+                    bias=False,
+                    device=device,
+                    dtype=torch.bfloat16,
+                )
+
+                shards = sorted(glob.glob(os.path.join(model_path, "model-*.safetensors")))
+                if not shards:
+                    raise FileNotFoundError(f"No safetensors shards found in {model_path}")
+
+                for sf_path in shards:
+                    log.info("Loading Veena shard: %s", os.path.basename(sf_path))
+                    tensors = safetensors.torch.load_file(sf_path, device="cpu")
+                    for full_name, tensor in tensors.items():
+                        if full_name.startswith("lm_head."):
+                            continue
+                        parts = full_name.split(".")
+                        parent = model
+                        for p in parts[:-1]:
+                            parent = getattr(parent, p)
+                        attr = parts[-1]
+
+                        if isinstance(parent, bnb.nn.Linear4bit) and attr == "weight":
+                            p4 = bnb.nn.Params4bit(tensor, requires_grad=False, quant_type="nf4").to(device)
+                            parent.weight = p4
+                        else:
+                            p_norm = torch.nn.Parameter(
+                                tensor.to(device, dtype=torch.bfloat16), requires_grad=False
+                            )
+                            setattr(parent, attr, p_norm)
+                    del tensors
+
+                if config.tie_word_embeddings:
+                    model.lm_head.weight = model.model.embed_tokens.weight
+
+                model.model.rotary_emb = LlamaRotaryEmbedding(config=config, device=device)
+                model.eval()
+                self._model = model
+                log.info(
+                    "Veena 4-bit loaded successfully on %s! VRAM allocated: %.2f GB",
+                    device,
+                    torch.cuda.memory_allocated() / (1024**3),
                 )
             except Exception as e:
-                log.warning("BitsAndBytes unavailable for 4-bit quant (%s), falling back to float16", e)
-                quant_config = None
+                log.exception("Custom 4-bit load failed (%s), falling back to standard from_pretrained", e)
+                self._model = None
 
-        torch_dtype = (
-            torch.bfloat16
-            if is_cuda and torch.cuda.is_bf16_supported()
-            else torch.float16
-            if is_cuda
-            else torch.float32
-        )
-
-        model_kwargs = {
-            "trust_remote_code": True,
-        }
-        if quant_config is not None:
-            model_kwargs["quantization_config"] = quant_config
-            model_kwargs["device_map"] = device
-        else:
-            model_kwargs["torch_dtype"] = torch_dtype
+        if self._model is None:
+            torch_dtype = (
+                torch.bfloat16
+                if is_cuda and torch.cuda.is_bf16_supported()
+                else torch.float16
+                if is_cuda
+                else torch.float32
+            )
+            model_kwargs = {"trust_remote_code": True, "torch_dtype": torch_dtype}
             if is_cuda:
                 model_kwargs["device_map"] = device
-
-        self._tokenizer = AutoTokenizer.from_pretrained(self.model_id, trust_remote_code=True)
-        self._model = AutoModelForCausalLM.from_pretrained(self.model_id, **model_kwargs)
-        if not is_cuda:
-            self._model.to("cpu")
-        self._model.eval()
+            self._model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
+            if not is_cuda:
+                self._model.to("cpu")
+            self._model.eval()
 
         # Initialize SNAC 24kHz neural audio codec
         try:

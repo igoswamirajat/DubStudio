@@ -126,6 +126,21 @@ async def cancel_job(job_id: str):
     return {"ok": True}
 
 
+@router.post("/jobs/{job_id}/resume")
+async def resume_job(job_id: str):
+    job = store.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    if job.get("state") == "completed":
+        return {"ok": True, "state": "completed", "message": "Job already completed"}
+    job["state"] = "queued"
+    job["error"] = None
+    job["message"] = "Resuming from checkpoint..."
+    store.save(job)
+    await enqueue(job_id)
+    return {"ok": True, "job_id": job_id, "state": "queued"}
+
+
 @router.get("/jobs/{job_id}/download")
 def download(job_id: str, artifact: str = "json"):
     job = store.get(job_id)
