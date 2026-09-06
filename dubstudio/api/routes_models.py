@@ -118,6 +118,24 @@ def _disk_stats(dir_path: Path) -> dict[str, Any]:
         }
 
 
+def _calc_unique_bytes(path: Path) -> int:
+    """Calculate unique file bytes on disk, deduplicating hardlinks."""
+    if not path.is_dir():
+        return 0
+    seen_inodes = set()
+    total = 0
+    for f in path.rglob("*"):
+        if f.is_file():
+            try:
+                stat = f.stat()
+                if stat.st_ino not in seen_inodes:
+                    seen_inodes.add(stat.st_ino)
+                    total += stat.st_size
+            except Exception:
+                pass
+    return total
+
+
 def _check_model_downloaded(storage_dir: Path, repo_id: str) -> tuple[bool, float]:
     """Check if model snapshot exists in storage_dir/hub/models--..."""
     hub_dir = storage_dir / "hub"
@@ -130,8 +148,8 @@ def _check_model_downloaded(storage_dir: Path, repo_id: str) -> tuple[bool, floa
     if not snapshots.is_dir() or not any(snapshots.iterdir()):
         return False, 0.0
 
-    # Calculate total MB in directory
-    total_bytes = sum(f.stat().st_size for f in target.rglob("*") if f.is_file())
+    # Calculate actual unique MB in directory (avoiding hardlink double-counting)
+    total_bytes = _calc_unique_bytes(target)
     return True, round(total_bytes / (1024 * 1024), 1)
 
 
@@ -192,16 +210,13 @@ def list_models():
         prog = DOWNLOAD_STATUS.get(m["id"])
         if prog and prog.get("status") == "downloading":
             m["status"] = "downloading"
-            # Calculate actual downloaded bytes on disk in real time
+            # Calculate actual unique downloaded bytes on disk in real time
             hub_dir = storage_dir / "hub"
             folder = hub_dir / f"models--{m['repo_id'].replace('/', '--')}"
-            dl_bytes = 0
-            if folder.is_dir():
-                dl_bytes += sum(f.stat().st_size for f in folder.rglob("*") if f.is_file())
+            dl_bytes = _calc_unique_bytes(folder)
             for extra in m.get("extra_repos", []):
                 extra_folder = hub_dir / f"models--{extra.replace('/', '--')}"
-                if extra_folder.is_dir():
-                    dl_bytes += sum(f.stat().st_size for f in extra_folder.rglob("*") if f.is_file())
+                dl_bytes += _calc_unique_bytes(extra_folder)
 
             dl_mb = round(dl_bytes / (1024 * 1024), 1)
             target_mb = max(1, m["size_mb"])
@@ -279,13 +294,21 @@ def download_model(payload: DownloadModelPayload):
     storage_dir = _get_active_storage_dir()
     repos = [target["repo_id"]] + list(target.get("extra_repos") or [])
 
-    # Check available disk space
+    # Check available disk space (accounting for already downloaded chunks)
     usage = shutil.disk_usage(str(storage_dir))
     free_mb = usage.free / (1024 * 1024)
-    if free_mb < target["size_mb"]:
+
+    hub_dir = storage_dir / "hub"
+    already_bytes = _calc_unique_bytes(hub_dir / f"models--{target['repo_id'].replace('/', '--')}")
+    for extra in target.get("extra_repos", []):
+        already_bytes += _calc_unique_bytes(hub_dir / f"models--{extra.replace('/', '--')}")
+    already_mb = already_bytes / (1024 * 1024)
+    needed_mb = max(0.0, target["size_mb"] - already_mb)
+
+    if free_mb < needed_mb and needed_mb > 50:
         raise HTTPException(
             status_code=400,
-            detail=f"Insufficient disk space on {storage_dir}. Needs {target['size_mb']} MB, but only {int(free_mb)} MB is free.",
+            detail=f"Insufficient disk space on {storage_dir}. Needs {int(needed_mb)} MB more, but only {int(free_mb)} MB is free.",
         )
 
     token = settings.hf_token or os.environ.get("HF_TOKEN") or None

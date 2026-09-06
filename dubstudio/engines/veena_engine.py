@@ -119,6 +119,7 @@ class VeenaEngine(VoiceEngine):
         quant_config = None
         if is_cuda and self.load_in_4bit:
             try:
+                import bitsandbytes  # noqa: F401
                 from transformers import BitsAndBytesConfig
 
                 quant_config = BitsAndBytesConfig(
@@ -128,7 +129,8 @@ class VeenaEngine(VoiceEngine):
                     bnb_4bit_use_double_quant=True,
                 )
             except Exception as e:
-                log.warning("BitsAndBytes unavailable for 4-bit quant (%s), using float16", e)
+                log.warning("BitsAndBytes unavailable for 4-bit quant (%s), falling back to float16", e)
+                quant_config = None
 
         torch_dtype = (
             torch.bfloat16
