@@ -35,6 +35,20 @@ def _advance(job_id: str, state: str, percent: int, message: str) -> dict:
     return job
 
 
+def _cleanup_memory():
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
+
 def _load_transcript(job_dir) -> dict | None:
     path = job_dir / "asr" / "transcript.json"
     if path.exists():
@@ -141,6 +155,7 @@ def run_job(job_id: str) -> dict:
     job["tts_engine"] = settings.tts_engine
     store.save(job)
     if not done("synthesizing"):
+        _cleanup_memory()
         run_synthesis(job_dir, job)
         mark_done(job_dir, "synthesizing")
 

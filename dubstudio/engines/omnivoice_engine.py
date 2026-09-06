@@ -57,7 +57,13 @@ class OmniVoiceEngine(VoiceEngine):
     def warmup(self) -> None:
         if self._model is not None:
             return
+        import gc
         import torch
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         from omnivoice import OmniVoice
 
         device = self._pick_device()

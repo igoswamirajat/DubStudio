@@ -24,6 +24,15 @@ def create_app() -> FastAPI:
 
         os.environ.setdefault("HF_HOME", settings.hf_home)
         os.environ["HF_HOME"] = settings.hf_home
+
+    d_temp = Path("D:/temp")
+    if d_temp.is_dir():
+        import os, tempfile
+
+        for env_var in ("TMP", "TEMP", "TMPDIR"):
+            os.environ[env_var] = str(d_temp)
+        tempfile.tempdir = str(d_temp)
+
     from dubstudio.jobs.store import store
 
     store.recover_interrupted()
