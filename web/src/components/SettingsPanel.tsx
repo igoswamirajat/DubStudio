@@ -1,4 +1,16 @@
 import { useEffect, useState } from "react";
+import {
+  Settings as SettingsIcon,
+  Globe,
+  Cpu,
+  Radio,
+  Sliders,
+  Check,
+  ChevronDown,
+  ChevronUp,
+  Save,
+  Key,
+} from "lucide-react";
 import { getSettings, patchSettings, type AppSettings } from "../api";
 
 const TRANSLATORS = ["ollama", "openai", "demo"];
@@ -21,6 +33,7 @@ export function SettingsPanel({ onSaved }: { onSaved?: () => void }) {
   function set(k: string, v: unknown) {
     setDraft((d) => ({ ...d, [k]: v }));
   }
+
   function val<K extends keyof AppSettings>(k: K): AppSettings[K] | undefined {
     return (draft[k as string] as AppSettings[K]) ?? s?.[k];
   }
@@ -33,7 +46,8 @@ export function SettingsPanel({ onSaved }: { onSaved?: () => void }) {
       const next = await patchSettings(draft);
       setS(next);
       setDraft({});
-      setMsg("Saved");
+      setMsg("Studio configuration updated and saved to .env");
+      setTimeout(() => setMsg(""), 3000);
       onSaved?.();
     } catch (e) {
       setErr(String(e));
@@ -45,152 +59,209 @@ export function SettingsPanel({ onSaved }: { onSaved?: () => void }) {
   const translator = (val("translator") as string) || "ollama";
 
   return (
-    <section className="card">
-      <button className="btn ghost settings-toggle" onClick={() => setOpen((o) => !o)}>
-        ⚙️ Settings {open ? "▲" : "▼"}
+    <section className="settings-card">
+      <button
+        className="settings-toggle-trigger"
+        onClick={() => setOpen((o) => !o)}
+      >
+        <div className="trigger-left">
+          <SettingsIcon size={16} className="trigger-icon" />
+          <span className="trigger-title">Studio Engine &amp; AI Settings</span>
+          <span className="badge-pill">Runtime Config</span>
+        </div>
+        <div className="trigger-right">
+          {open ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+        </div>
       </button>
-      {open && !s && <p className="muted">Loading…</p>}
+
+      {open && !s && <div className="settings-loading">Loading studio config…</div>}
+
       {open && s && (
-        <div className="settings-body">
-          <div className="grid3">
-            <div>
-              <label>Translator</label>
-              <select value={translator} onChange={(e) => set("translator", e.target.value)}>
-                {TRANSLATORS.map((t) => (
-                  <option key={t}>{t}</option>
-                ))}
-              </select>
+        <div className="settings-content-body">
+          {/* Section 1: Translation Provider */}
+          <div className="settings-section">
+            <h4 className="section-head">
+              <Globe size={14} /> AI Translation Engine
+            </h4>
+            <div className="settings-grid">
+              <div className="input-group">
+                <label>Provider</label>
+                <select
+                  value={translator}
+                  onChange={(e) => set("translator", e.target.value)}
+                >
+                  {TRANSLATORS.map((t) => (
+                    <option key={t} value={t}>
+                      {t.toUpperCase()}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {translator === "ollama" && (
+                <>
+                  <div className="input-group">
+                    <label>Ollama Host URL</label>
+                    <input
+                      type="text"
+                      value={(val("ollama_host") as string) || ""}
+                      placeholder="http://127.0.0.1:11434"
+                      onChange={(e) => set("ollama_host", e.target.value)}
+                    />
+                  </div>
+                  <div className="input-group">
+                    <label>Model Name</label>
+                    <input
+                      type="text"
+                      value={(val("ollama_model") as string) || ""}
+                      placeholder="qwen2.5:7b"
+                      onChange={(e) => set("ollama_model", e.target.value)}
+                    />
+                  </div>
+                </>
+              )}
+
+              {translator === "openai" && (
+                <>
+                  <div className="input-group">
+                    <label>API Base URL</label>
+                    <input
+                      type="text"
+                      value={(val("openai_base_url") as string) || ""}
+                      placeholder="https://api.openai.com/v1"
+                      onChange={(e) => set("openai_base_url", e.target.value)}
+                    />
+                  </div>
+                  <div className="input-group">
+                    <label>Model</label>
+                    <input
+                      type="text"
+                      value={(val("openai_model") as string) || ""}
+                      placeholder="gpt-4o-mini"
+                      onChange={(e) => set("openai_model", e.target.value)}
+                    />
+                  </div>
+                  <div className="input-group">
+                    <label>API Key {s.openai_api_key_set && "✓ (Saved)"}</label>
+                    <input
+                      type="password"
+                      placeholder={
+                        s.openai_api_key_set ? "•••••••• (Leave blank to keep)" : "sk-..."
+                      }
+                      onChange={(e) => set("openai_api_key", e.target.value)}
+                    />
+                  </div>
+                </>
+              )}
             </div>
-            {translator === "ollama" && (
-              <>
-                <div>
-                  <label>Ollama host</label>
-                  <input
-                    type="text"
-                    value={(val("ollama_host") as string) || ""}
-                    onChange={(e) => set("ollama_host", e.target.value)}
-                  />
-                </div>
-                <div>
-                  <label>Ollama model</label>
-                  <input
-                    type="text"
-                    value={(val("ollama_model") as string) || ""}
-                    onChange={(e) => set("ollama_model", e.target.value)}
-                  />
-                </div>
-              </>
+          </div>
+
+          {/* Section 2: Speech & Voice Models */}
+          <div className="settings-section">
+            <h4 className="section-head">
+              <Cpu size={14} /> Voice &amp; Transcription Engines
+            </h4>
+            <div className="settings-grid">
+              <div className="input-group">
+                <label>TTS Primary Engine</label>
+                <select
+                  value={(val("tts_engine") as string) || "omnivoice"}
+                  onChange={(e) => set("tts_engine", e.target.value)}
+                >
+                  {TTS.map((t) => (
+                    <option key={t} value={t}>
+                      {t}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="input-group">
+                <label>ASR Speech-to-Text</label>
+                <select
+                  value={(val("asr_engine") as string) || "faster-whisper"}
+                  onChange={(e) => set("asr_engine", e.target.value)}
+                >
+                  {ASR.map((a) => (
+                    <option key={a} value={a}>
+                      {a}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="input-group">
+                <label>Whisper Model Size</label>
+                <select
+                  value={(val("whisper_model") as string) || "large-v3"}
+                  onChange={(e) => set("whisper_model", e.target.value)}
+                >
+                  {WHISPER.map((w) => (
+                    <option key={w} value={w}>
+                      {w}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          </div>
+
+          {/* Section 3: Hardware & Separation */}
+          <div className="settings-section">
+            <h4 className="section-head">
+              <Sliders size={14} /> Separation &amp; Hardware Flags
+            </h4>
+            <div className="checkbox-row">
+              <label className="toggle-switch">
+                <input
+                  type="checkbox"
+                  checked={Boolean(val("enable_diarization"))}
+                  onChange={(e) => set("enable_diarization", e.target.checked)}
+                />
+                <span className="toggle-slider" />
+                <span className="toggle-text">Pyannote Speaker Diarization</span>
+              </label>
+
+              <label className="toggle-switch">
+                <input
+                  type="checkbox"
+                  checked={Boolean(val("skip_separation"))}
+                  onChange={(e) => set("skip_separation", e.target.checked)}
+                />
+                <span className="toggle-slider" />
+                <span className="toggle-text">Skip Demucs Separation (Fast demo mode)</span>
+              </label>
+
+              <label className="toggle-switch">
+                <input
+                  type="checkbox"
+                  checked={Boolean(val("low_vram"))}
+                  onChange={(e) => set("low_vram", e.target.checked)}
+                />
+                <span className="toggle-slider" />
+                <span className="toggle-text">Low VRAM Optimization (sequential models)</span>
+              </label>
+            </div>
+          </div>
+
+          {/* Footer Actions */}
+          <div className="settings-footer">
+            <button
+              className="btn primary"
+              disabled={saving || Object.keys(draft).length === 0}
+              onClick={save}
+            >
+              <Save size={14} />
+              <span>{saving ? "Saving Changes…" : "Save Studio Config"}</span>
+            </button>
+
+            {msg && (
+              <span className="settings-feedback-toast">
+                <Check size={14} /> {msg}
+              </span>
             )}
-            {translator === "openai" && (
-              <>
-                <div>
-                  <label>API base URL</label>
-                  <input
-                    type="text"
-                    value={(val("openai_base_url") as string) || ""}
-                    onChange={(e) => set("openai_base_url", e.target.value)}
-                  />
-                </div>
-                <div>
-                  <label>API model</label>
-                  <input
-                    type="text"
-                    value={(val("openai_model") as string) || ""}
-                    onChange={(e) => set("openai_model", e.target.value)}
-                  />
-                </div>
-                <div>
-                  <label>API key {s.openai_api_key_set ? "(set)" : ""}</label>
-                  <input
-                    type="password"
-                    placeholder={s.openai_api_key_set ? "•••••• (leave blank to keep)" : "sk-…"}
-                    onChange={(e) => set("openai_api_key", e.target.value)}
-                  />
-                </div>
-              </>
-            )}
+            {err && <span className="settings-err-toast">{err}</span>}
           </div>
-
-          <div className="grid3">
-            <div>
-              <label>TTS engine</label>
-              <select value={(val("tts_engine") as string) || "omnivoice"} onChange={(e) => set("tts_engine", e.target.value)}>
-                {TTS.map((t) => (
-                  <option key={t}>{t}</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label>ASR engine</label>
-              <select value={(val("asr_engine") as string) || "faster-whisper"} onChange={(e) => set("asr_engine", e.target.value)}>
-                {ASR.map((t) => (
-                  <option key={t}>{t}</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label>Whisper model</label>
-              <select value={(val("whisper_model") as string) || "large-v3"} onChange={(e) => set("whisper_model", e.target.value)}>
-                {WHISPER.map((t) => (
-                  <option key={t}>{t}</option>
-                ))}
-              </select>
-            </div>
-          </div>
-
-          <div className="grid3">
-            <div>
-              <label>HF token {s.hf_token_set ? "(set)" : ""}</label>
-              <input
-                type="password"
-                placeholder={s.hf_token_set ? "•••••• (leave blank to keep)" : "hf_…"}
-                onChange={(e) => set("hf_token", e.target.value)}
-              />
-            </div>
-            <div>
-              <label>Max speakers (0 = auto)</label>
-              <input
-                type="number"
-                min={0}
-                value={Number(val("max_speakers") ?? 0)}
-                onChange={(e) => set("max_speakers", Number(e.target.value))}
-              />
-            </div>
-            <label className="check">
-              <input
-                type="checkbox"
-                checked={!!val("enable_diarization")}
-                onChange={(e) => set("enable_diarization", e.target.checked)}
-              />
-              Diarization
-            </label>
-          </div>
-
-          <div className="grid3">
-            <label className="check">
-              <input
-                type="checkbox"
-                checked={!!val("skip_separation")}
-                onChange={(e) => set("skip_separation", e.target.checked)}
-              />
-              Skip separation
-            </label>
-            <label className="check">
-              <input
-                type="checkbox"
-                checked={!!val("low_vram")}
-                onChange={(e) => set("low_vram", e.target.checked)}
-              />
-              Low VRAM
-            </label>
-            <div className="actions">
-              <button disabled={saving || !Object.keys(draft).length} onClick={save}>
-                {saving ? "Saving…" : "Save settings"}
-              </button>
-            </div>
-          </div>
-          {msg && <p className="muted">{msg}</p>}
-          {err && <p className="err">{err}</p>}
         </div>
       )}
     </section>

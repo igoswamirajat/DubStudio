@@ -1,12 +1,20 @@
 import { useState } from "react";
+import { Mic, Wand2, Bot, Volume2, Sparkles, UserCheck } from "lucide-react";
 import type { Speaker } from "../api";
 import { patchSpeaker, speakerRefUrl } from "../api";
 
 const MODES = [
-  { id: "clone", label: "Clone original" },
-  { id: "design", label: "Design new voice" },
-  { id: "auto", label: "Auto voice" },
+  { id: "clone", label: "Clone Original", icon: Mic },
+  { id: "design", label: "Design Voice", icon: Wand2 },
+  { id: "auto", label: "Auto Match", icon: Bot },
 ] as const;
+
+const PRESETS = [
+  "male, deep narrator, calm tone",
+  "female, young adult, clear diction",
+  "energetic male, conversational",
+  "authoritative female, documentary",
+];
 
 type Props = {
   jobId: string;
@@ -35,47 +43,75 @@ export function SpeakerCard({ jobId, speaker, onChange }: Props) {
   }
 
   return (
-    <article className="speaker-card">
-      <header>
-        <div className="avatar">{(label || "S").slice(0, 1).toUpperCase()}</div>
-        <div className="meta">
+    <article className="modern-speaker-card">
+      <header className="spk-header">
+        <div className="spk-avatar">
+          {(label || "S").slice(0, 1).toUpperCase()}
+        </div>
+        <div className="spk-meta">
           <input
-            className="label-input"
+            className="spk-label-input"
             value={label}
             disabled={busy}
+            placeholder="Speaker name"
             onChange={(e) => setLabel(e.target.value)}
             onBlur={() => {
               if (label !== speaker.label) save({ label });
             }}
           />
-          <span className="muted">{speaker.speaker_id} · {speaker.segment_count ?? 0} lines</span>
+          <span className="spk-subinfo">
+            <code>{speaker.speaker_id}</code> · {speaker.segment_count ?? 0}{" "}
+            lines spoken
+          </span>
         </div>
       </header>
 
-      <audio controls src={speakerRefUrl(jobId, speaker.speaker_id)} preload="none" />
-
-      <div className="mode-row">
-        {MODES.map((m) => (
-          <button
-            key={m.id}
-            type="button"
-            className={mode === m.id ? "chip active" : "chip"}
-            disabled={busy}
-            onClick={async () => {
-              setMode(m.id);
-              await save({ voice_mode: m.id });
-            }}
-          >
-            {m.label}
-          </button>
-        ))}
+      {/* Reference Audio Player */}
+      <div className="spk-audio-box">
+        <div className="audio-label">
+          <Volume2 size={13} className="audio-icon" />
+          <span>Vocal Reference Sample (Original)</span>
+        </div>
+        <audio
+          controls
+          src={speakerRefUrl(jobId, speaker.speaker_id)}
+          preload="none"
+          className="spk-audio-player"
+        />
       </div>
 
+      {/* Voice Mode Selector Pills */}
+      <div className="spk-mode-pills">
+        {MODES.map((m) => {
+          const Icon = m.icon;
+          const isActive = mode === m.id;
+          return (
+            <button
+              key={m.id}
+              type="button"
+              className={`mode-pill ${isActive ? "active" : ""}`}
+              disabled={busy}
+              onClick={async () => {
+                setMode(m.id);
+                await save({ voice_mode: m.id });
+              }}
+            >
+              <Icon size={13} />
+              <span>{m.label}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Voice Design Instruct Field */}
       {mode === "design" && (
-        <div className="design-box">
-          <label>Voice design prompt</label>
+        <div className="spk-design-section">
+          <label className="design-label">
+            <Sparkles size={12} /> Voice Prompt (OmniVoice instruct)
+          </label>
           <input
-            placeholder='e.g. female, young adult, hindi accent'
+            className="design-input"
+            placeholder="e.g. female, young adult, hindi accent"
             value={design}
             disabled={busy}
             onChange={(e) => setDesign(e.target.value)}
@@ -85,11 +121,25 @@ export function SpeakerCard({ jobId, speaker, onChange }: Props) {
               }
             }}
           />
-          <p className="hint">OmniVoice instruct: gender, age, pitch, accent…</p>
+          <div className="preset-chips">
+            {PRESETS.map((p) => (
+              <button
+                key={p}
+                type="button"
+                className="preset-chip"
+                onClick={() => {
+                  setDesign(p);
+                  save({ design_prompt: p, voice_mode: "design" });
+                }}
+              >
+                {p}
+              </button>
+            ))}
+          </div>
         </div>
       )}
 
-      {err && <p className="err">{err}</p>}
+      {err && <p className="spk-err">{err}</p>}
     </article>
   );
 }

@@ -1,11 +1,25 @@
 import { useEffect, useRef, useState } from "react";
-import { listSegments, patchSegment, resynthSegment, type Segment } from "../api";
+import {
+  Clock,
+  Play,
+  RotateCw,
+  User,
+  Check,
+  Subtitles,
+  Volume2,
+} from "lucide-react";
+import {
+  listSegments,
+  patchSegment,
+  resynthSegment,
+  type Segment,
+} from "../api";
 
 function fmt(t: number): string {
   const m = Math.floor(t / 60);
   const s = Math.floor(t % 60);
-  const ms = Math.floor((t - Math.floor(t)) * 1000);
-  return `${m}:${s.toString().padStart(2, "0")}.${ms.toString().padStart(3, "0")}`;
+  const ms = Math.floor((t - Math.floor(t)) * 100);
+  return `${m}:${s.toString().padStart(2, "0")}.${ms.toString().padStart(2, "0")}`;
 }
 
 type Props = {
@@ -16,15 +30,27 @@ type Props = {
   onArtifacts?: () => void;
 };
 
-export function SegmentEditor({ jobId, currentTime, speakerIds, onSeek, onArtifacts }: Props) {
+export function SegmentEditor({
+  jobId,
+  currentTime,
+  speakerIds,
+  onSeek,
+  onArtifacts,
+}: Props) {
   const [segments, setSegments] = useState<Segment[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
+  const [savedId, setSavedId] = useState<string | null>(null);
   const [err, setErr] = useState("");
   const drafts = useRef<Record<string, string>>({});
 
   async function reload() {
-    const r = await listSegments(jobId);
-    setSegments(r.segments);
+    try {
+      const r = await listSegments(jobId);
+      const items = Array.isArray(r) ? r : Array.isArray(r?.segments) ? r.segments : [];
+      setSegments(items);
+    } catch {
+      setSegments([]);
+    }
   }
 
   useEffect(() => {
@@ -38,8 +64,12 @@ export function SegmentEditor({ jobId, currentTime, speakerIds, onSeek, onArtifa
     try {
       await patchSegment(jobId, seg.segment_id, { translated_text: text });
       setSegments((prev) =>
-        prev.map((s) => (s.segment_id === seg.segment_id ? { ...s, translated_text: text } : s)),
+        (prev || []).map((s) =>
+          s.segment_id === seg.segment_id ? { ...s, translated_text: text } : s
+        )
       );
+      setSavedId(seg.segment_id);
+      setTimeout(() => setSavedId(null), 1500);
     } catch (e) {
       setErr(String(e));
     }
@@ -49,14 +79,16 @@ export function SegmentEditor({ jobId, currentTime, speakerIds, onSeek, onArtifa
     try {
       await patchSegment(jobId, seg.segment_id, patch);
       setSegments((prev) =>
-        prev.map((s) => (s.segment_id === seg.segment_id ? { ...s, ...patch } : s)),
+        (prev || []).map((s) =>
+          s.segment_id === seg.segment_id ? { ...s, ...patch } : s
+        )
       );
     } catch (e) {
       setErr(String(e));
     }
   }
 
-  const speakers = speakerIds && speakerIds.length ? speakerIds : ["S00"];
+  const speakers = Array.isArray(speakerIds) && speakerIds.length ? speakerIds : ["S00"];
 
   async function regen(seg: Segment) {
     setBusy(seg.segment_id);
@@ -73,83 +105,155 @@ export function SegmentEditor({ jobId, currentTime, speakerIds, onSeek, onArtifa
     }
   }
 
-  if (!segments.length) return null;
+  const safeSegments = Array.isArray(segments) ? segments : [];
+  if (!safeSegments.length) return null;
 
   return (
-    <section>
-      <h2>Timeline &amp; transcript</h2>
-      <p className="muted">
-        Edit a translated line and re-generate just that segment. The final MP4 is re-mixed after each
-        re-synth.
-      </p>
-      {err && <p className="err">{err}</p>}
-      <div className="seg-list">
-        {segments.map((seg) => {
+    <div className="segment-editor-card">
+      <div className="segment-editor-header">
+        <div>
+          <h3 className="section-title">
+            <Subtitles size={18} className="title-icon" /> Timeline &amp; Line
+            Editor
+          </h3>
+          <p className="section-subtitle">
+            Fine-tune translated dialogue, adjust window timestamps, or trigger
+            one-click re-synthesis for any line.
+          </p>
+        </div>
+        <span className="badge-count">{safeSegments.length} lines</span>
+      </div>
+
+      {err && <div className="toast-err">{err}</div>}
+
+      <div className="segment-track-list">
+        {safeSegments.map((seg, idx) => {
           const active =
-            currentTime != null && currentTime >= seg.start && currentTime < seg.end;
+            currentTime != null &&
+            currentTime >= seg.start &&
+            currentTime < seg.end;
+          const isBusy = busy === seg.segment_id;
+          const isJustSaved = savedId === seg.segment_id;
+
           return (
-            <div key={seg.segment_id} className={`seg-row${active ? " active" : ""}`}>
-              <button className="seg-time" title="Jump to" onClick={() => onSeek?.(seg.start)}>
-                {fmt(seg.start)}
-              </button>
-              <select
-                className="seg-spk-sel"
-                value={seg.speaker_id || "S00"}
-                onChange={(e) => saveField(seg, { speaker_id: e.target.value })}
-              >
-                {speakers.map((sp) => (
-                  <option key={sp} value={sp}>
-                    {sp}
-                  </option>
-                ))}
-              </select>
-              <div className="seg-texts">
-                {seg.source_text && <p className="seg-src muted">{seg.source_text}</p>}
-                <textarea
-                  className="seg-edit"
-                  defaultValue={seg.translated_text || ""}
-                  onChange={(e) => (drafts.current[seg.segment_id] = e.target.value)}
-                  onBlur={() => saveText(seg)}
-                  rows={2}
-                />
-                <div className="seg-timing">
-                  <label>
-                    start
+            <div
+              key={seg.segment_id}
+              className={`segment-card-row ${active ? "active-playback" : ""}`}
+            >
+              {/* Left Column: Jump time & Speaker tag */}
+              <div className="seg-meta-col">
+                <button
+                  className="seg-seek-pill tabular"
+                  title="Jump to timecode"
+                  onClick={() => onSeek?.(seg.start)}
+                >
+                  <Play size={11} className="seek-play-icon" />
+                  <span>{fmt(seg.start)}</span>
+                </button>
+
+                <div className="speaker-select-pill">
+                  <User size={12} className="spk-icon" />
+                  <select
+                    value={seg.speaker_id || "S00"}
+                    onChange={(e) =>
+                      saveField(seg, { speaker_id: e.target.value })
+                    }
+                  >
+                    {speakers.map((sp) => (
+                      <option key={sp} value={sp}>
+                        {sp}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <span className="seg-index-tag">#{idx + 1}</span>
+              </div>
+
+              {/* Middle Column: Original source & Translated editor */}
+              <div className="seg-content-col">
+                {seg.source_text && (
+                  <p className="seg-original-text">
+                    <span className="lang-tag">ORIGINAL</span>
+                    {seg.source_text}
+                  </p>
+                )}
+
+                <div className="seg-editor-wrapper">
+                  <textarea
+                    className="seg-textarea"
+                    defaultValue={seg.translated_text || ""}
+                    placeholder="Enter translated dialogue line…"
+                    onChange={(e) =>
+                      (drafts.current[seg.segment_id] = e.target.value)
+                    }
+                    onBlur={() => saveText(seg)}
+                    rows={2}
+                  />
+                  {isJustSaved && (
+                    <span className="saved-indicator" title="Auto-saved">
+                      <Check size={12} /> Saved
+                    </span>
+                  )}
+                </div>
+
+                <div className="seg-timing-controls">
+                  <div className="time-input-group">
+                    <Clock size={12} />
+                    <label>Start</label>
                     <input
                       type="number"
-                      step="0.01"
+                      step="0.05"
                       defaultValue={seg.start}
+                      className="tabular"
                       onBlur={(e) => {
                         const v = parseFloat(e.target.value);
-                        if (!Number.isNaN(v) && v !== seg.start) saveField(seg, { start: v });
+                        if (!Number.isNaN(v) && v !== seg.start)
+                          saveField(seg, { start: v });
                       }}
                     />
-                  </label>
-                  <label>
-                    end
+                    <span>s</span>
+                  </div>
+
+                  <div className="time-input-group">
+                    <Clock size={12} />
+                    <label>End</label>
                     <input
                       type="number"
-                      step="0.01"
+                      step="0.05"
                       defaultValue={seg.end}
+                      className="tabular"
                       onBlur={(e) => {
                         const v = parseFloat(e.target.value);
-                        if (!Number.isNaN(v) && v !== seg.end) saveField(seg, { end: v });
+                        if (!Number.isNaN(v) && v !== seg.end)
+                          saveField(seg, { end: v });
                       }}
                     />
-                  </label>
+                    <span>s</span>
+                  </div>
+
+                  <span className="duration-tag tabular">
+                    Window: {(seg.end - seg.start).toFixed(2)}s
+                  </span>
                 </div>
               </div>
-              <button
-                className="btn ghost seg-regen"
-                disabled={busy === seg.segment_id}
-                onClick={() => regen(seg)}
-              >
-                {busy === seg.segment_id ? "…" : "Re-synth"}
-              </button>
+
+              {/* Right Column: Re-synth button */}
+              <div className="seg-actions-col">
+                <button
+                  className={`btn ghost seg-resynth-btn ${isBusy ? "busy" : ""}`}
+                  disabled={isBusy}
+                  onClick={() => regen(seg)}
+                  title="Re-synthesize this line"
+                >
+                  <RotateCw size={13} className={isBusy ? "spin" : ""} />
+                  <span>{isBusy ? "Synthesizing…" : "Re-synth"}</span>
+                </button>
+              </div>
             </div>
           );
         })}
       </div>
-    </section>
+    </div>
   );
 }

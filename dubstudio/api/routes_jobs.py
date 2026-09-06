@@ -85,6 +85,12 @@ def get_job(job_id: str):
     job = store.get(job_id)
     if not job:
         raise HTTPException(404, {"error": {"code": "JOB_NOT_FOUND", "message": job_id}})
+    base = settings.jobs_dir / job_id
+    has_output = (base / "export" / "output.mp4").is_file()
+    src_dir = base / "source"
+    has_source = any(p.is_file() and p.name != "meta.json" for p in src_dir.glob("*")) if src_dir.is_dir() else False
+    job["has_output"] = has_output
+    job["has_source"] = has_source
     return job
 
 
@@ -94,7 +100,8 @@ def get_segments(job_id: str):
     if not path.exists():
         return {"segments": []}
 
-    return json.loads(path.read_text(encoding="utf-8"))
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    return {"segments": raw if isinstance(raw, list) else raw.get("segments", [])}
 
 
 @router.delete("/jobs/{job_id}")
@@ -145,15 +152,23 @@ def media(job_id: str, kind: str):
     base = settings.jobs_dir / job_id
     if kind == "output":
         path = base / "export" / "output.mp4"
+        if not path or not path.exists():
+            raise HTTPException(404, {"error": {"code": "OUTPUT_NOT_READY", "message": "Dubbed output video is not ready yet."}})
     elif kind == "source":
         src_dir = base / "source"
         cands = [p for p in src_dir.glob("*") if p.is_file() and p.name != "meta.json"] if src_dir.is_dir() else []
         path = cands[0] if cands else None
+        if not path or not path.exists():
+            raise HTTPException(404, {"error": {"code": "SOURCE_NOT_FOUND", "message": "Source video file not found."}})
     else:
         raise HTTPException(400, "kind must be source or output")
-    if not path or not path.exists():
-        raise HTTPException(404, "media not ready")
-    return FileResponse(path, media_type="video/mp4", content_disposition_type="inline")
+
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        content_disposition_type="inline",
+        headers={"Accept-Ranges": "bytes"},
+    )
 
 
 @router.get("/jobs/{job_id}/events")

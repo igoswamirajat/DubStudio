@@ -1,5 +1,21 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  UploadCloud,
+  Film,
+  Sparkles,
+  Play,
+  RotateCcw,
+  Trash2,
+  Download,
+  AlertCircle,
+  FileText,
+  Clock,
+  ChevronRight,
+  RefreshCw,
+  Sliders,
+  CheckCircle2,
+} from "lucide-react";
+import {
   cancelJob,
   createJob,
   deleteJob,
@@ -8,31 +24,31 @@ import {
   health,
   listJobs,
   listSpeakers,
-  mediaUrl,
   resumeJob,
   subscribeJob,
   type Job,
   type Speaker,
 } from "./api";
+import { StudioPlayer } from "./components/StudioPlayer";
 import { SpeakerCard } from "./components/SpeakerCard";
 import { SegmentEditor } from "./components/SegmentEditor";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ProgressPanel } from "./components/ProgressPanel";
 
 const LANGS = [
-  { id: "hi", label: "Hindi" },
+  { id: "hi", label: "Hindi (हिन्दी)" },
   { id: "en", label: "English" },
-  { id: "es", label: "Spanish" },
-  { id: "fr", label: "French" },
-  { id: "de", label: "German" },
-  { id: "ja", label: "Japanese" },
-  { id: "ko", label: "Korean" },
-  { id: "zh", label: "Chinese" },
+  { id: "es", label: "Spanish (Español)" },
+  { id: "fr", label: "French (Français)" },
+  { id: "de", label: "German (Deutsch)" },
+  { id: "ja", label: "Japanese (日本語)" },
+  { id: "ko", label: "Korean (한국어)" },
+  { id: "zh", label: "Chinese (中文)" },
 ];
 
 const ENGINES = [
-  { id: "omnivoice", label: "OmniVoice (primary)" },
-  { id: "dummy", label: "Dummy (CI / no GPU)" },
+  { id: "omnivoice", label: "OmniVoice (Primary Neural Cloning)" },
+  { id: "dummy", label: "Dummy Engine (Fast CI / Mock)" },
 ];
 
 const ACTIVE = (s?: string) =>
@@ -48,31 +64,58 @@ export function App() {
   const [speakers, setSpeakers] = useState<Speaker[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [err, setErr] = useState("");
-  const [health_, setHealth] = useState<Record<string, unknown> | null>(null);
+  const [health_, setHealth] = useState<Record<string, unknown>>({});
   const [submitting, setSubmitting] = useState(false);
   const [curTime, setCurTime] = useState(0);
   const [mediaBust, setMediaBust] = useState(0);
+  const [activeSegmentText, setActiveSegmentText] = useState("");
   const videoRef = useRef<HTMLVideoElement>(null);
 
   function refreshHealth() {
-    health().then(setHealth).catch(() => setHealth(null));
-  }
-  function refreshJobs() {
-    listJobs().then((r) => setJobs(r.jobs || [])).catch(() => void 0);
+    health().then(setHealth).catch(() => setHealth({}));
   }
 
+  function refreshJobs() {
+    listJobs()
+      .then((r) => setJobs(r.jobs || []))
+      .catch(() => void 0);
+  }
+
+  // Handle URL param ?job=<job_id>
   useEffect(() => {
     refreshHealth();
     refreshJobs();
+
+    const params = new URLSearchParams(window.location.search);
+    const initialJobId = params.get("job");
+    if (initialJobId) {
+      openJob(initialJobId);
+    }
   }, []);
 
-  // Live progress via SSE, with a polling safety net.
+  // Update URL search query when job changes
+  function selectJob(j: Job | null) {
+    setJob(j);
+    const url = new URL(window.location.href);
+    if (j?.job_id) {
+      url.searchParams.set("job", j.job_id);
+    } else {
+      url.searchParams.delete("job");
+    }
+    window.history.replaceState({}, "", url.toString());
+  }
+
+  // Live SSE progress subscription
   useEffect(() => {
     if (!job?.job_id || !ACTIVE(job.state)) return;
     const id = job.job_id;
-    const unsub = subscribeJob(id, (j) => setJob(j));
+    const unsub = subscribeJob(id, (j) => {
+      setJob((prev) => (prev?.job_id === id ? { ...prev, ...j } : prev));
+    });
     const poll = setInterval(() => {
-      getJob(id).then(setJob).catch(() => void 0);
+      getJob(id)
+        .then((j) => setJob((prev) => (prev?.job_id === id ? j : prev)))
+        .catch(() => void 0);
     }, 2000);
     return () => {
       unsub();
@@ -80,12 +123,14 @@ export function App() {
     };
   }, [job?.job_id, job?.state]);
 
-  // Load speaker cards once voices are enrolled.
+  // Fetch speakers when voices are enrolled or job completed
   useEffect(() => {
     if (!job?.job_id) return;
-    if ((job.percent ?? 0) < 65 && ACTIVE(job.state)) return;
+    if ((job.percent ?? 0) < 55 && ACTIVE(job.state)) return;
     listSpeakers(job.job_id)
-      .then((sp) => sp.speakers?.length && setSpeakers(sp.speakers))
+      .then((sp) => {
+        if (sp.speakers?.length) setSpeakers(sp.speakers);
+      })
       .catch(() => void 0);
   }, [job?.job_id, job?.percent, job?.state]);
 
@@ -96,7 +141,8 @@ export function App() {
     setSubmitting(true);
     try {
       const created = await createJob(file, lang, engine, skipSep, srcLang);
-      setJob(await getJob(created.job_id));
+      const j = await getJob(created.job_id);
+      selectJob(j);
       refreshJobs();
     } catch (e) {
       setErr(String(e));
@@ -110,11 +156,11 @@ export function App() {
     setSpeakers([]);
     try {
       const j = await getJob(id);
-      setJob(j);
+      selectJob(j);
       const sp = await listSpeakers(id);
       if (sp.speakers?.length) setSpeakers(sp.speakers);
     } catch (e) {
-      setErr(String(e));
+      setErr(`Failed to open project ${id}: ${String(e)}`);
     }
   }
 
@@ -122,7 +168,8 @@ export function App() {
     if (!job) return;
     try {
       await cancelJob(job.job_id);
-      setJob(await getJob(job.job_id));
+      const updated = await getJob(job.job_id);
+      setJob(updated);
       refreshJobs();
     } catch (e) {
       setErr(String(e));
@@ -133,7 +180,8 @@ export function App() {
     if (!job) return;
     try {
       await resumeJob(job.job_id);
-      setJob(await getJob(job.job_id));
+      const updated = await getJob(job.job_id);
+      setJob(updated);
       refreshJobs();
     } catch (e) {
       setErr(String(e));
@@ -144,7 +192,7 @@ export function App() {
     if (!job) return;
     try {
       await deleteJob(job.job_id);
-      setJob(null);
+      selectJob(null);
       setSpeakers([]);
       refreshJobs();
     } catch (e) {
@@ -152,196 +200,353 @@ export function App() {
     }
   }
 
-  const done = job?.state === "completed";
-  const videoSrc = job
-    ? `${mediaUrl(job.job_id, done ? "output" : "source")}?v=${mediaBust}`
-    : "";
+  const isDone = job?.state === "completed";
+  const safeJobs = Array.isArray(jobs) ? jobs : [];
+  const safeSpeakers = Array.isArray(speakers) ? speakers : [];
 
   return (
-    <main>
-      <header className="hero">
-        <div>
-          <p className="eyebrow">Local-first · OmniVoice · BGM preserved</p>
-          <h1>DubStudio</h1>
-          <p className="lede">
-            Upload a clip. Clone speakers or design new voices. Keep original music &amp; SFX.
-          </p>
+    <div className="studio-app">
+      {/* Studio Header */}
+      <header className="studio-topbar">
+        <div className="topbar-branding">
+          <div className="studio-logo-icon">
+            <Sparkles size={20} />
+          </div>
+          <div>
+            <h1 className="studio-title">DubStudio</h1>
+            <p className="studio-tagline">
+              Local-first AI Video Dubbing &amp; Voice Cloning Studio
+            </p>
+          </div>
         </div>
-        <div className="status-pill">{healthLabel(health_)}</div>
-      </header>
 
-      <SettingsPanel onSaved={refreshHealth} />
-
-      <section className="card grid">
-        <div>
-          <label>Video</label>
-          <input
-            type="file"
-            accept="video/*"
-            onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-          />
-        </div>
-        <div>
-          <label>Source language</label>
-          <select value={srcLang} onChange={(e) => setSrcLang(e.target.value)}>
-            <option value="">Auto-detect</option>
-            {LANGS.map((l) => (
-              <option key={l.id} value={l.id}>
-                {l.label}
-              </option>
-            ))}
-          </select>
-        </div>
-        <div>
-          <label>Target language</label>
-          <select value={lang} onChange={(e) => setLang(e.target.value)}>
-            {LANGS.map((l) => (
-              <option key={l.id} value={l.id}>
-                {l.label}
-              </option>
-            ))}
-          </select>
-        </div>
-        <div>
-          <label>TTS engine</label>
-          <select value={engine} onChange={(e) => setEngine(e.target.value)}>
-            {ENGINES.map((e) => (
-              <option key={e.id} value={e.id}>
-                {e.label}
-              </option>
-            ))}
-          </select>
-        </div>
-        <label className="check">
-          <input type="checkbox" checked={skipSep} onChange={(e) => setSkipSep(e.target.checked)} />
-          Skip separation
-        </label>
-        <div className="actions">
-          <button disabled={!file || submitting} onClick={start}>
-            {submitting ? "Uploading…" : "Start dub"}
+        <div className="topbar-controls">
+          <div className="health-badge-container">
+            <span
+              className={`health-dot ${health_.ok ? "live" : "offline"}`}
+            />
+            <span className="health-text">{healthSummary(health_)}</span>
+          </div>
+          <button
+            className="icon-circle-btn"
+            onClick={() => {
+              refreshHealth();
+              refreshJobs();
+            }}
+            title="Refresh Studio Status"
+          >
+            <RefreshCw size={15} />
           </button>
         </div>
-      </section>
+      </header>
 
-      {jobs.length > 0 && (
-        <section className="card">
-          <h2 className="hist-h">Recent jobs</h2>
-          <div className="hist-list">
-            {jobs.slice(0, 8).map((j) => (
-              <button
-                key={j.job_id}
-                className={`hist-row${job?.job_id === j.job_id ? " active" : ""}`}
-                onClick={() => openJob(j.job_id)}
-              >
-                <span className="hist-state">{j.state}</span>
-                <span className="hist-lang muted">→ {j.target_language || "?"}</span>
-                <code className="muted">{j.job_id.slice(0, 18)}…</code>
-              </button>
-            ))}
-          </div>
-        </section>
-      )}
+      <main className="studio-main-layout">
+        {/* Global Settings Drawer */}
+        <SettingsPanel onSaved={refreshHealth} />
 
-      {job && (
-        <section className="card">
-          <div className="job-head">
-            <code className="muted">{job.job_id}</code>
-          </div>
+        {/* Top Studio Grid: Upload & Studio Workspace */}
+        <div className="studio-grid-layout">
+          {/* Left / Top: Upload Card */}
+          <section className="studio-card create-job-card">
+            <h2 className="card-headline">
+              <UploadCloud size={18} className="headline-icon" /> New Dubbing Job
+            </h2>
+            <p className="card-subtext">
+              Drop any video file. Dialogue will be translated and voice-cloned
+              while preserving original background music &amp; SFX.
+            </p>
 
-          <ProgressPanel job={job} />
-
-          {videoSrc && (
-            <video
-              ref={videoRef}
-              className="preview"
-              src={videoSrc}
-              controls
-              preload="metadata"
-              onError={() => setErr("")}
-              onTimeUpdate={(e) => setCurTime((e.target as HTMLVideoElement).currentTime)}
-            />
-          )}
-
-          <div className="downloads">
-            {done && (
-              <>
-                <a className="btn" href={downloadUrl(job.job_id, "mp4")}>
-                  Download MP4
-                </a>
-                <a className="btn ghost" href={downloadUrl(job.job_id, "srt")}>
-                  Download SRT
-                </a>
-              </>
-            )}
-            {ACTIVE(job.state) && (
-              <button className="btn ghost" onClick={onCancel}>
-                Cancel
-              </button>
-            )}
-            {(job.state === "failed" || job.state === "canceled") && (
-              <button className="btn" onClick={onResume}>
-                Resume
-              </button>
-            )}
-            {!ACTIVE(job.state) && (
-              <button className="btn danger" onClick={onDelete}>
-                Delete
-              </button>
-            )}
-          </div>
-          {job.state === "failed" && <p className="err">{job.error || "failed"}</p>}
-        </section>
-      )}
-
-      {speakers.length > 0 && job && (
-        <section>
-          <h2>Speakers</h2>
-          <p className="muted">
-            Clone the original voice, or design a new one. Changes apply to synthesis for this job.
-          </p>
-          <div className="speaker-grid">
-            {speakers.map((s) => (
-              <SpeakerCard
-                key={s.speaker_id}
-                jobId={job.job_id}
-                speaker={s}
-                onChange={(updated) =>
-                  setSpeakers((prev) =>
-                    prev.map((x) => (x.speaker_id === updated.speaker_id ? updated : x)),
-                  )
-                }
+            <div className="upload-dropzone">
+              <input
+                type="file"
+                id="video-upload-input"
+                accept="video/*"
+                onChange={(e) => setFile(e.target.files?.[0] ?? null)}
               />
-            ))}
+              <label htmlFor="video-upload-input" className="dropzone-label">
+                <Film size={28} className="dropzone-icon" />
+                <span className="dropzone-title">
+                  {file ? file.name : "Choose a video clip or drag it here"}
+                </span>
+                <span className="dropzone-meta">
+                  {file
+                    ? `${(file.size / (1024 * 1024)).toFixed(1)} MB`
+                    : "MP4, MOV, WebM, MKV up to 500 MB"}
+                </span>
+              </label>
+            </div>
+
+            <div className="job-options-grid">
+              <div className="option-field">
+                <label>Source Language</label>
+                <select
+                  value={srcLang}
+                  onChange={(e) => setSrcLang(e.target.value)}
+                >
+                  <option value="">Auto-detect (Whisper)</option>
+                  {LANGS.map((l) => (
+                    <option key={l.id} value={l.id}>
+                      {l.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="option-field">
+                <label>Target Language</label>
+                <select
+                  value={lang}
+                  onChange={(e) => setLang(e.target.value)}
+                >
+                  {LANGS.map((l) => (
+                    <option key={l.id} value={l.id}>
+                      {l.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="option-field">
+                <label>Voice Clone Engine</label>
+                <select
+                  value={engine}
+                  onChange={(e) => setEngine(e.target.value)}
+                >
+                  {ENGINES.map((e) => (
+                    <option key={e.id} value={e.id}>
+                      {e.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <div className="job-flags-row">
+              <label className="checkbox-pill">
+                <input
+                  type="checkbox"
+                  checked={skipSep}
+                  onChange={(e) => setSkipSep(e.target.checked)}
+                />
+                <span>Skip Demucs Separation (Faster preview)</span>
+              </label>
+            </div>
+
+            <div className="submit-action-bar">
+              <button
+                className="btn primary large-btn"
+                disabled={!file || submitting}
+                onClick={start}
+              >
+                <Sparkles size={16} />
+                <span>
+                  {submitting ? "Uploading Video Clip…" : "Start AI Dubbing"}
+                </span>
+              </button>
+            </div>
+          </section>
+
+          {/* Right / Top: Recent Projects Drawer */}
+          {safeJobs.length > 0 && (
+            <aside className="studio-card recent-jobs-panel">
+              <div className="panel-header">
+                <h3>
+                  <Clock size={16} /> Recent Projects
+                </h3>
+                <span className="badge-count">{safeJobs.length}</span>
+              </div>
+              <div className="recent-jobs-scroller">
+                {safeJobs.slice(0, 10).map((j) => {
+                  const isSelected = job?.job_id === j.job_id;
+                  const isCompleted = j.state === "completed";
+                  const isFailed = j.state === "failed";
+
+                  return (
+                    <button
+                      key={j.job_id}
+                      className={`recent-job-row ${isSelected ? "selected" : ""}`}
+                      onClick={() => openJob(j.job_id)}
+                    >
+                      <div className="row-left">
+                        <span
+                          className={`state-bullet ${
+                            isCompleted ? "ok" : isFailed ? "err" : "live"
+                          }`}
+                        />
+                        <div className="job-info">
+                          <span className="job-filename">
+                            {j.source_filename || j.job_id.slice(0, 20)}
+                          </span>
+                          <span className="job-sub">
+                            {(j.target_language || "hi").toUpperCase()} ·{" "}
+                            {j.state.replace(/_/g, " ")}
+                          </span>
+                        </div>
+                      </div>
+                      <ChevronRight size={14} className="chevron" />
+                    </button>
+                  );
+                })}
+              </div>
+            </aside>
+          )}
+        </div>
+
+        {/* Active Project Workspace */}
+        {job && (
+          <section className="studio-card active-job-workspace">
+            <div className="workspace-header">
+              <div className="workspace-title-group">
+                <span className="job-id-pill">
+                  <code>{job.job_id}</code>
+                </span>
+                <span
+                  className={`status-chip ${
+                    isDone ? "chip-ok" : job.state === "failed" ? "chip-fail" : "chip-live"
+                  }`}
+                >
+                  {job.state.replace(/_/g, " ").toUpperCase()}
+                </span>
+                {job.duration_s && (
+                  <span className="duration-pill">
+                    {job.duration_s.toFixed(1)}s duration
+                  </span>
+                )}
+              </div>
+
+              <div className="workspace-actions">
+                {isDone && (
+                  <>
+                    <a
+                      className="btn primary"
+                      href={downloadUrl(job.job_id, "mp4")}
+                      download="dubbed_output.mp4"
+                    >
+                      <Download size={14} /> Download Dubbed MP4
+                    </a>
+                    <a
+                      className="btn ghost"
+                      href={downloadUrl(job.job_id, "srt")}
+                      download="subtitles.srt"
+                    >
+                      <FileText size={14} /> Download SRT
+                    </a>
+                  </>
+                )}
+                {ACTIVE(job.state) && (
+                  <button className="btn ghost" onClick={onCancel}>
+                    Cancel Job
+                  </button>
+                )}
+                {(job.state === "failed" || job.state === "canceled") && (
+                  <button className="btn warning" onClick={onResume}>
+                    <RotateCcw size={14} /> Resume Checkpoint
+                  </button>
+                )}
+                {!ACTIVE(job.state) && (
+                  <button
+                    className="btn danger ghost"
+                    onClick={onDelete}
+                    title="Delete Job"
+                  >
+                    <Trash2 size={14} /> Delete
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* 12-Stage Honest Pipeline Progress */}
+            <ProgressPanel job={job} />
+
+            {/* High-End Studio Video Player */}
+            <StudioPlayer
+              job={job}
+              currentTime={curTime}
+              activeSegmentText={activeSegmentText}
+              mediaBust={mediaBust}
+              videoRef={videoRef}
+              onTimeUpdate={(t) => setCurTime(t)}
+            />
+
+            {job.state === "failed" && job.error && (
+              <div className="failure-alert">
+                <AlertCircle size={18} />
+                <div className="alert-content">
+                  <strong>Pipeline Stalled:</strong>
+                  <p>{job.error}</p>
+                </div>
+              </div>
+            )}
+          </section>
+        )}
+
+        {/* Speaker Enrollment & Voice Cloning Section */}
+        {safeSpeakers.length > 0 && job && (
+          <section className="studio-card speakers-section">
+            <div className="section-header">
+              <h2 className="section-title">
+                <Sparkles size={18} className="title-icon" /> Speaker Timbre &amp;
+                Voice Cards
+              </h2>
+              <p className="section-subtitle">
+                Original vocal samples are automatically isolated. Choose whether
+                to clone each voice verbatim, design a new voice with natural
+                language prompts, or auto-match.
+              </p>
+            </div>
+
+            <div className="speakers-grid">
+              {safeSpeakers.map((s) => (
+                <SpeakerCard
+                  key={s.speaker_id}
+                  jobId={job.job_id}
+                  speaker={s}
+                  onChange={(updated) =>
+                    setSpeakers((prev) =>
+                      (prev || []).map((x) =>
+                        x.speaker_id === updated.speaker_id ? updated : x
+                      )
+                    )
+                  }
+                />
+              ))}
+            </div>
+          </section>
+        )}
+
+        {/* Interactive Segment Timeline Editor */}
+        {job && (job.percent ?? 0) >= 45 && (
+          <SegmentEditor
+            jobId={job.job_id}
+            currentTime={curTime}
+            speakerIds={safeSpeakers.map((s) => s.speaker_id)}
+            onSeek={(t) => {
+              if (videoRef.current) {
+                videoRef.current.currentTime = t;
+                videoRef.current.play().catch(() => void 0);
+              }
+            }}
+            onArtifacts={() => setMediaBust((n) => n + 1)}
+          />
+        )}
+
+        {err && (
+          <div className="global-error-toast">
+            <AlertCircle size={16} />
+            <span>{err}</span>
           </div>
-        </section>
-      )}
-
-      {job && (job.percent ?? 0) >= 48 && (
-        <SegmentEditor
-          jobId={job.job_id}
-          currentTime={curTime}
-          speakerIds={speakers.map((s) => s.speaker_id)}
-          onSeek={(t) => {
-            if (videoRef.current) {
-              videoRef.current.currentTime = t;
-              videoRef.current.play().catch(() => void 0);
-            }
-          }}
-          onArtifacts={() => setMediaBust((n) => n + 1)}
-        />
-      )}
-
-      {err && <p className="err">{err}</p>}
-    </main>
+        )}
+      </main>
+    </div>
   );
 }
 
-function healthLabel(h: Record<string, unknown> | null): string {
-  if (!h) return "Checking API…";
+function healthSummary(h: Record<string, unknown>): string {
+  if (!h || !Object.keys(h).length) return "Connecting…";
   const parts: string[] = [];
-  parts.push(h.ffmpeg ? "FFmpeg" : "no FFmpeg");
-  if (h.gpu) parts.push("GPU");
-  if (h.asr) parts.push(`ASR:${h.asr}`);
-  if (h.tts) parts.push(`TTS:${h.tts}`);
-  return parts.join(" · ");
+  if (h.gpu) parts.push("GPU Active");
+  if (h.asr) parts.push(`ASR: ${h.asr}`);
+  if (h.tts) parts.push(`TTS: ${h.tts}`);
+  if (h.ffmpeg) parts.push("FFmpeg OK");
+  return parts.length ? parts.join(" · ") : "Online";
 }

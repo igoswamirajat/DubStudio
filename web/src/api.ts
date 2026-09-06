@@ -8,10 +8,15 @@ export type Job = {
   stage_index?: number;
   stage_total?: number;
   target_language?: string;
+  source_language?: string;
   tts_engine?: string;
   speakers?: Speaker[];
   artifacts?: Record<string, string>;
   error?: string | null;
+  has_output?: boolean;
+  has_source?: boolean;
+  duration_s?: number;
+  source_filename?: string;
 };
 
 export type Speaker = {
@@ -61,9 +66,15 @@ export async function createJob(
 }
 
 export async function listJobs(): Promise<{ jobs: Job[] }> {
-  const res = await fetch(`${base}/jobs`);
-  if (!res.ok) return { jobs: [] };
-  return res.json();
+  try {
+    const res = await fetch(`${base}/jobs`);
+    if (!res.ok) return { jobs: [] };
+    const data = await res.json();
+    if (Array.isArray(data)) return { jobs: data };
+    return { jobs: Array.isArray(data?.jobs) ? data.jobs : [] };
+  } catch {
+    return { jobs: [] };
+  }
 }
 
 export async function getJob(id: string): Promise<Job> {
@@ -73,9 +84,15 @@ export async function getJob(id: string): Promise<Job> {
 }
 
 export async function listSpeakers(jobId: string): Promise<{ speakers: Speaker[] }> {
-  const res = await fetch(`${base}/jobs/${jobId}/speakers`);
-  if (!res.ok) return { speakers: [] };
-  return res.json();
+  try {
+    const res = await fetch(`${base}/jobs/${jobId}/speakers`);
+    if (!res.ok) return { speakers: [] };
+    const data = await res.json();
+    if (Array.isArray(data)) return { speakers: data };
+    return { speakers: Array.isArray(data?.speakers) ? data.speakers : [] };
+  } catch {
+    return { speakers: [] };
+  }
 }
 
 export async function patchSpeaker(
@@ -105,9 +122,15 @@ export function mediaUrl(jobId: string, kind: "source" | "output") {
 }
 
 export async function listSegments(jobId: string): Promise<{ segments: Segment[] }> {
-  const res = await fetch(`${base}/jobs/${jobId}/segments`);
-  if (!res.ok) return { segments: [] };
-  return res.json();
+  try {
+    const res = await fetch(`${base}/jobs/${jobId}/segments`);
+    if (!res.ok) return { segments: [] };
+    const data = await res.json();
+    if (Array.isArray(data)) return { segments: data };
+    return { segments: Array.isArray(data?.segments) ? data.segments : [] };
+  } catch {
+    return { segments: [] };
+  }
 }
 
 export async function patchSegment(
