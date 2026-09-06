@@ -143,7 +143,7 @@ def run_job(job_id: str) -> dict:
     # --- enroll voices ---
     _advance(job_id, "enrolling_voices", 65, "Enrolling speaker voices")
     if not (done("enrolling_voices") and (job_dir / "voices" / "speaker_map.json").exists()):
-        speaker_map = run_enroll(job_dir)
+        speaker_map = run_enroll(job_dir, job=job)
         job = store.get(job_id)
         job["speakers"] = speaker_map.get("speakers", [])
         store.save(job)

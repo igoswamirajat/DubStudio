@@ -82,6 +82,7 @@ def run_synthesis(job_dir: Path, job: dict) -> list[dict]:
                 voice_mode=voice_mode,
                 ref_text=ref_text,
                 instruct=design_prompt,
+                target_duration_ms=seg.get("target_duration_ms"),
             ),
             out,
         )

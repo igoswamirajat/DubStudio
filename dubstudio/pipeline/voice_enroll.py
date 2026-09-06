@@ -7,8 +7,8 @@ import subprocess
 from pathlib import Path
 
 
-def run_enroll(job_dir: Path, speaker_overrides: dict | None = None) -> dict:
-    """Cut a short ref clip per speaker from vocals.
+def run_enroll(job_dir: Path, speaker_overrides: dict | None = None, job: dict | None = None) -> dict:
+    """Cut a short ref clip per speaker from vocals and intelligently match voices.
 
     speaker_overrides (from UI / overrides.json):
       { "S00": { "voice_mode": "clone"|"design"|"fixed", "voice_id": "...", "design_prompt": "...", "ref_text": "..." } }
@@ -32,7 +32,8 @@ def run_enroll(job_dir: Path, speaker_overrides: dict | None = None) -> dict:
         except Exception:
             pass
 
-    speakers = []
+    # 1. Cut reference audio per speaker
+    speakers_raw = []
     for sid, segs in by_speaker.items():
         best = max(segs, key=lambda s: float(s["end"]) - float(s["start"]))
         start = float(best["start"])
@@ -53,29 +54,75 @@ def run_enroll(job_dir: Path, speaker_overrides: dict | None = None) -> dict:
         ]
         subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        # best segment source text as optional ref_text seed (helps OmniVoice)
         best_text = (best.get("source_text") or best.get("translated_text") or "").strip()
+        speakers_raw.append({
+            "speaker_id": sid,
+            "ref_start": start,
+            "ref_end": end,
+            "ref_wav": str(ref.relative_to(job_dir)),
+            "ref_text": best_text,
+            "segment_count": len(segs),
+            "segs": segs,
+        })
 
+    # 2. Determine TTS Engine
+    tts_engine = "veena"
+    if job and job.get("tts_engine"):
+        tts_engine = job["tts_engine"]
+    else:
+        job_json_path = job_dir / "job.json"
+        if job_json_path.exists():
+            try:
+                meta = json.loads(job_json_path.read_text(encoding="utf-8"))
+                tts_engine = meta.get("tts_engine") or "veena"
+            except Exception:
+                pass
+
+    # 3. Intelligent Voice Matching for each character
+    from dubstudio.pipeline.voice_matcher import match_voices_for_job
+
+    matched_voices = match_voices_for_job(
+        speakers=[{"speaker_id": s["speaker_id"]} for s in speakers_raw],
+        job_dir=job_dir,
+        tts_engine=tts_engine,
+        overrides=overrides,
+    )
+
+    # 4. Finalize speaker assignments and propagate consistently to segments
+    final_speakers = []
+    for s_info in speakers_raw:
+        sid = s_info["speaker_id"]
+        segs = s_info["segs"]
         ov = overrides.get(sid) or {}
-        voice_mode = ov.get("voice_mode", "clone")
-        voice_id = ov.get("voice_id", sid)
-        design_prompt = ov.get("design_prompt")
-        ref_text = ov.get("ref_text") or best_text or None
+        m = matched_voices.get(sid) or {}
 
-        speakers.append(
-            {
-                "speaker_id": sid,
-                "label": ov.get("label") or f"Speaker {sid[1:] if sid.startswith('S') else sid}",
-                "voice_id": voice_id,
-                "voice_mode": voice_mode,
-                "design_prompt": design_prompt,
-                "ref_text": ref_text,
-                "ref_wav": str(ref.relative_to(job_dir)),
-                "ref_start": start,
-                "ref_end": end,
-                "segment_count": len(segs),
-            }
-        )
+        voice_id = ov.get("voice_id") or m.get("voice_id") or sid
+        voice_mode = ov.get("voice_mode") or m.get("voice_mode") or "clone"
+        design_prompt = ov.get("design_prompt")
+        ref_text = ov.get("ref_text") or s_info["ref_text"] or None
+
+        label = ov.get("label") or f"Speaker {sid[1:] if sid.startswith('S') else sid}"
+        if m.get("persona"):
+            label = f"{label} ({m['persona'].replace('_', ' ').title()})"
+
+        spk_entry = {
+            "speaker_id": sid,
+            "label": label,
+            "voice_id": voice_id,
+            "voice_mode": voice_mode,
+            "gender": m.get("gender"),
+            "f0_median": m.get("f0_median"),
+            "persona": m.get("persona"),
+            "design_prompt": design_prompt,
+            "ref_text": ref_text,
+            "ref_wav": s_info["ref_wav"],
+            "ref_start": s_info["ref_start"],
+            "ref_end": s_info["ref_end"],
+            "segment_count": s_info["segment_count"],
+        }
+        final_speakers.append(spk_entry)
+
+        # 100% guarantee that every segment of this speaker uses this exact resolved voice
         for seg in segs:
             seg["voice_id"] = voice_id
             seg["voice_mode"] = voice_mode
@@ -83,6 +130,7 @@ def run_enroll(job_dir: Path, speaker_overrides: dict | None = None) -> dict:
     segs_path.write_text(json.dumps(segments, indent=2, ensure_ascii=False), encoding="utf-8")
     map_path = job_dir / "voices" / "speaker_map.json"
     map_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"speakers": speakers}
+    payload = {"speakers": final_speakers}
     map_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     return payload
+

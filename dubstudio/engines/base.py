@@ -15,6 +15,7 @@ class SynthRequest:
     voice_mode: str = "clone"  # clone | design | fixed | auto
     ref_text: str | None = None  # transcript of ref_wav (helps cloning)
     instruct: str | None = None  # e.g. "female, young adult, hindi accent"
+    target_duration_ms: int | None = None
 
 
 @dataclass
