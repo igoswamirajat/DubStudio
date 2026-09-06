@@ -46,26 +46,61 @@ def _decode_snac_tokens(snac_tokens: list[int], snac_model) -> list[float] | Non
     offsets = [AUDIO_CODE_BASE_OFFSET + i * 4096 for i in range(7)]
 
     for i in range(0, len(snac_tokens), 7):
-        # Level 0 (1 token)
+        # Level 0: Coarse (1 token)
         codes_lvl[0].append(snac_tokens[i] - offsets[0])
-        # Level 1 (2 tokens)
+        # Level 1: Medium (2 tokens)
         codes_lvl[1].append(snac_tokens[i + 1] - offsets[1])
-        codes_lvl[1].append(snac_tokens[i + 2] - offsets[2])
-        # Level 2 (4 tokens)
-        for j in range(4):
-            codes_lvl[2].append(snac_tokens[i + 3 + j] - offsets[3 + j])
+        codes_lvl[1].append(snac_tokens[i + 4] - offsets[4])
+        # Level 2: Fine (4 tokens)
+        codes_lvl[2].append(snac_tokens[i + 2] - offsets[2])
+        codes_lvl[2].append(snac_tokens[i + 3] - offsets[3])
+        codes_lvl[2].append(snac_tokens[i + 5] - offsets[5])
+        codes_lvl[2].append(snac_tokens[i + 6] - offsets[6])
 
-    # Format tensors with batch dimension
-    codes = [
-        torch.tensor([lvl], dtype=torch.long, device=device)
-        for lvl in codes_lvl
-    ]
+    hierarchical_codes = []
+    for lvl_codes in codes_lvl:
+        tensor = torch.tensor(lvl_codes, dtype=torch.int32, device=device).unsqueeze(0)
+        if torch.any((tensor < 0) | (tensor > 4095)):
+            log.warning("SNAC token values out of range [0, 4095]")
+            return None
+        hierarchical_codes.append(tensor)
 
     with torch.no_grad():
-        audio_hat = snac_model.decode(codes)
+        audio_hat = snac_model.decode(hierarchical_codes)
 
     # Flatten audio output to 1D numpy array
-    return audio_hat[0, 0].cpu().numpy().tolist()
+    return audio_hat.squeeze().clamp(-1, 1).cpu().numpy().tolist()
+
+
+def _detect_ref_gender(ref_path: Path | str | None) -> str | None:
+    """Analyze pitch F0 of reference clip to classify speaker as male or female."""
+    if not ref_path:
+        return None
+    try:
+        import numpy as np
+        import soundfile as sf
+
+        path = Path(ref_path)
+        if not path.is_file():
+            return None
+        data, sr = sf.read(str(path))
+        if len(data.shape) > 1:
+            data = data[:, 0]
+        data = data[: int(sr * 3.0)]
+        data = data - np.mean(data)
+        corr = np.correlate(data, data, mode="full")
+        corr = corr[len(corr) // 2 :]
+        min_lag = int(sr / 350)
+        max_lag = int(sr / 75)
+        d = np.diff(corr)
+        start = np.where(d > 0)[0]
+        if len(start) > 0 and start[0] < max_lag:
+            peak = start[0] + np.argmax(corr[start[0]:max_lag])
+            f0 = sr / peak
+            return "male" if f0 < 160 else "female"
+    except Exception:
+        pass
+    return None
 
 
 class VeenaEngine(VoiceEngine):
@@ -102,6 +137,7 @@ class VeenaEngine(VoiceEngine):
         """Find local Hugging Face snapshot directory if model was downloaded."""
         try:
             from dubstudio.api.routes_models import _get_active_storage_dir
+
             base = _get_active_storage_dir() / "hub"
             repo_slug = f"models--{self.model_id.replace('/', '--')}"
             snap_base = base / repo_slug / "snapshots"
@@ -258,7 +294,15 @@ class VeenaEngine(VoiceEngine):
         if "female" in inst:
             return "kavya"
 
-        # 4. Deterministic speaker ID mapping (S00 -> kavya, S01 -> agastya, etc.)
+        # 4. Auto-detect gender from reference audio if available
+        if req.ref_wav:
+            detected = _detect_ref_gender(req.ref_wav)
+            if detected == "male":
+                return "agastya"
+            if detected == "female":
+                return "kavya"
+
+        # 5. Deterministic speaker ID mapping (S00 -> kavya, S01 -> agastya, etc.)
         if vid.startswith("s") and vid[1:].isdigit():
             idx = int(vid[1:]) % len(VOICE_CYCLE)
             return VOICE_CYCLE[idx]
@@ -310,9 +354,9 @@ class VeenaEngine(VoiceEngine):
                 input_ids,
                 max_new_tokens=max_tokens,
                 do_sample=True,
-                temperature=0.65,
-                top_p=0.92,
-                repetition_penalty=1.08,
+                temperature=0.4,
+                top_p=0.9,
+                repetition_penalty=1.05,
                 pad_token_id=self._tokenizer.pad_token_id,
                 eos_token_id=[END_OF_SPEECH_TOKEN, END_OF_AI_TOKEN],
             )

@@ -67,3 +67,47 @@ def test_unknown_engine_falls_back_to_dummy():
     eng = get_voice_engine("not_a_real_engine_xyz")
     assert eng.name == "dummy"
 
+
+def test_veena_snac_deinterleaving():
+    import torch
+    from dubstudio.engines.veena_engine import AUDIO_CODE_BASE_OFFSET, _decode_snac_tokens
+
+    class MockSnac(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.param = torch.nn.Parameter(torch.zeros(1))
+            self.hierarchical_codes = None
+
+        def decode(self, codes):
+            self.hierarchical_codes = codes
+            return torch.zeros(1, 1, 100)
+
+    # Prepare 7 tokens: indices 0..6 mapped to values 10, 20, 30, 40, 50, 60, 70
+    offsets = [AUDIO_CODE_BASE_OFFSET + i * 4096 for i in range(7)]
+    val_map = [10, 20, 30, 40, 50, 60, 70]
+    tokens = [offsets[i] + val_map[i] for i in range(7)]
+
+    mock_snac = MockSnac()
+    result = _decode_snac_tokens(tokens, mock_snac)
+    assert result is not None
+    assert len(result) == 100
+
+    codes = mock_snac.hierarchical_codes
+    assert len(codes) == 3
+    # Level 0: coarse (index 0 -> val_map[0]=10)
+    assert codes[0].shape == (1, 1)
+    assert codes[0][0, 0].item() == 10
+
+    # Level 1: medium (index 1 -> val_map[1]=20, index 4 -> val_map[4]=50)
+    assert codes[1].shape == (1, 2)
+    assert codes[1][0, 0].item() == 20
+    assert codes[1][0, 1].item() == 50
+
+    # Level 2: fine (indices 2,3,5,6 -> val_map[2]=30, val_map[3]=40, val_map[5]=60, val_map[6]=70)
+    assert codes[2].shape == (1, 4)
+    assert codes[2][0, 0].item() == 30
+    assert codes[2][0, 1].item() == 40
+    assert codes[2][0, 2].item() == 60
+    assert codes[2][0, 3].item() == 70
+
+
