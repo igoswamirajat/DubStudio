@@ -50,6 +50,20 @@ def test_omnivoice_request_falls_back_cleanly():
     assert eng.name in {"omnivoice", "dummy"}
 
 
+def test_veena_request_resolves_or_falls_back():
+    eng = get_voice_engine("veena")
+    assert eng is not None
+    assert eng.name in {"veena", "dummy"}
+    if eng.name == "veena":
+        # Check voice resolver
+        from dubstudio.engines.veena_engine import VeenaEngine
+        v_eng = VeenaEngine()
+        assert v_eng._resolve_voice(SynthRequest(text="hi", language="hi", voice_id="S00", ref_wav=None)) == "kavya"
+        assert v_eng._resolve_voice(SynthRequest(text="hi", language="hi", voice_id="S01", ref_wav=None)) == "agastya"
+        assert v_eng._resolve_voice(SynthRequest(text="hi", language="hi", voice_id="custom", instruct="male narrator", ref_wav=None)) == "agastya"
+
+
 def test_unknown_engine_falls_back_to_dummy():
     eng = get_voice_engine("not_a_real_engine_xyz")
     assert eng.name == "dummy"
+

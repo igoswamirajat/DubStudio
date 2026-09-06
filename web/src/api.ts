@@ -231,3 +231,67 @@ export async function patchSettings(body: Partial<Record<string, unknown>>): Pro
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
+
+export type StorageInfo = {
+  storage_path: string;
+  drive: string;
+  total_gb: number;
+  free_gb: number;
+  used_gb: number;
+  free_percent: number;
+  is_low_space: boolean;
+};
+
+export type ModelItem = {
+  id: string;
+  name: string;
+  category: "tts" | "asr" | "separation" | "diarization";
+  recommended_for?: string;
+  badge: string;
+  repo_id: string;
+  size_mb: number;
+  description: string;
+  status: "downloaded" | "not_downloaded" | "downloading" | "error";
+  progress: number;
+  progress_message?: string;
+  size_on_disk_mb?: number;
+};
+
+export async function getStorageInfo(): Promise<StorageInfo> {
+  const res = await fetch(`${base}/models/storage`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function updateStorageDir(storage_path: string): Promise<StorageInfo> {
+  const res = await fetch(`${base}/models/storage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ storage_path }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function getModels(): Promise<{ models: ModelItem[]; storage: StorageInfo }> {
+  const res = await fetch(`${base}/models`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function downloadModel(model_id: string): Promise<{ status: string; message: string }> {
+  const res = await fetch(`${base}/models/download`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model_id }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function getModelDownloadProgress(): Promise<{ downloads: Record<string, Record<string, unknown>> }> {
+  const res = await fetch(`${base}/models/download/progress`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+

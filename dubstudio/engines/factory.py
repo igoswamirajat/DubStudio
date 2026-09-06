@@ -18,6 +18,15 @@ def get_voice_engine(name: str | None = None) -> VoiceEngine:
     """
     name = (name or settings.tts_engine or "omnivoice").lower().strip()
 
+    # --- Veena (Maya Research - SOTA Hindi/English) ---
+    if name in {"veena", "veena_tts", "maya"}:
+        try:
+            from dubstudio.engines.veena_engine import VeenaEngine
+
+            return VeenaEngine()
+        except Exception:
+            pass  # fall through to dummy
+
     # --- OmniVoice (primary) ---
     if name in {"omnivoice", "omni", "omni_voice"}:
         try:

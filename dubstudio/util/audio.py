@@ -1,9 +1,58 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
+
+
+def resample_audio(data: np.ndarray, orig_sr: int, target_sr: int, axis: int = 0) -> np.ndarray:
+    """High-fidelity audio resampling with polyphase anti-aliasing filter."""
+    if orig_sr == target_sr or len(data) == 0:
+        return data.astype(np.float32)
+
+    try:
+        from scipy.signal import resample_poly
+
+        g = math.gcd(orig_sr, target_sr)
+        up = target_sr // g
+        down = orig_sr // g
+        resampled = resample_poly(data, up, down, axis=axis)
+        return resampled.astype(np.float32)
+    except Exception:
+        # Fallback linear interpolation
+        length = data.shape[axis]
+        target_len = int(round(length * (target_sr / orig_sr)))
+        x_old = np.linspace(0, 1, num=length, endpoint=False)
+        x_new = np.linspace(0, 1, num=target_len, endpoint=False)
+        if data.ndim == 1:
+            return np.interp(x_new, x_old, data).astype(np.float32)
+        out = np.empty((target_len, data.shape[1]), dtype=np.float32)
+        for ch in range(data.shape[1]):
+            out[:, ch] = np.interp(x_new, x_old, data[:, ch])
+        return out
+
+
+def apply_micro_fades(data: np.ndarray, fade_ms: float = 5.0, sample_rate: int = 48000) -> np.ndarray:
+    """Apply raised-cosine micro fades at boundaries to eliminate digital clicks."""
+    fade_len = int(round(fade_ms / 1000.0 * sample_rate))
+    n = data.shape[0]
+    if fade_len <= 0 or n < fade_len * 2:
+        return data
+
+    t = np.linspace(0, np.pi / 2, fade_len, dtype=np.float32)
+    fade_in = (np.sin(t) ** 2).astype(np.float32)
+    fade_out = (np.cos(t) ** 2).astype(np.float32)
+
+    data = data.copy()
+    if data.ndim == 1:
+        data[:fade_len] *= fade_in
+        data[-fade_len:] *= fade_out
+    else:
+        data[:fade_len, :] *= fade_in[:, None]
+        data[-fade_len:, :] *= fade_out[:, None]
+    return data
 
 
 def write_silence(path: Path, duration_s: float, sample_rate: int = 48000, channels: int = 1) -> None:
@@ -30,18 +79,23 @@ def duration_ms(path: Path) -> int:
     return int(round(info.duration * 1000))
 
 
-def read_mono(path: Path, target_sr: int = 48000) -> tuple[np.ndarray, int]:
+def read_audio(path: Path, target_sr: int = 48000, mono: bool = False) -> tuple[np.ndarray, int]:
+    """Read audio from file, preserving stereo if mono=False, and resample cleanly."""
     data, sr = sf.read(str(path), always_2d=False)
-    if data.ndim > 1:
-        data = data.mean(axis=1)
+    data = data.astype(np.float32)
+
+    if mono and data.ndim > 1:
+        data = data.mean(axis=-1)
+
     if sr != target_sr:
-        duration = len(data) / sr
-        n = int(duration * target_sr)
-        x_old = np.linspace(0, 1, num=len(data), endpoint=False)
-        x_new = np.linspace(0, 1, num=n, endpoint=False)
-        data = np.interp(x_new, x_old, data).astype(np.float32)
+        data = resample_audio(data, sr, target_sr, axis=0)
         sr = target_sr
-    return data.astype(np.float32), sr
+
+    return data, sr
+
+
+def read_mono(path: Path, target_sr: int = 48000) -> tuple[np.ndarray, int]:
+    return read_audio(path, target_sr=target_sr, mono=True)
 
 
 def write_wav(path: Path, data: np.ndarray, sample_rate: int = 48000) -> None:

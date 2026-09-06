@@ -152,7 +152,7 @@ def run_job(job_id: str) -> dict:
     # --- synthesis ---
     _advance(job_id, "synthesizing", 75, "Generating target speech")
     job = store.get(job_id)
-    job["tts_engine"] = settings.tts_engine
+    job["tts_engine"] = job.get("tts_engine") or settings.tts_engine
     store.save(job)
     if not done("synthesizing"):
         _cleanup_memory()

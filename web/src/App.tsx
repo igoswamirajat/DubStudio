@@ -14,6 +14,7 @@ import {
   RefreshCw,
   Sliders,
   CheckCircle2,
+  HardDrive,
 } from "lucide-react";
 import {
   cancelJob,
@@ -21,6 +22,7 @@ import {
   deleteJob,
   downloadUrl,
   getJob,
+  getStorageInfo,
   health,
   listJobs,
   listSpeakers,
@@ -28,12 +30,14 @@ import {
   subscribeJob,
   type Job,
   type Speaker,
+  type StorageInfo,
 } from "./api";
 import { StudioPlayer } from "./components/StudioPlayer";
 import { SpeakerCard } from "./components/SpeakerCard";
 import { SegmentEditor } from "./components/SegmentEditor";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ProgressPanel } from "./components/ProgressPanel";
+import { ModelManagerModal } from "./components/ModelManagerModal";
 
 const LANGS = [
   { id: "hi", label: "Hindi (हिन्दी)" },
@@ -47,6 +51,7 @@ const LANGS = [
 ];
 
 const ENGINES = [
+  { id: "veena", label: "Veena by Maya Research (SOTA Hindi & English)" },
   { id: "omnivoice", label: "OmniVoice (Primary Neural Cloning)" },
   { id: "dummy", label: "Dummy Engine (Fast CI / Mock)" },
 ];
@@ -59,7 +64,7 @@ export function App() {
   const [lang, setLang] = useState("hi");
   const [srcLang, setSrcLang] = useState("");
   const [skipSep, setSkipSep] = useState(false);
-  const [engine, setEngine] = useState("omnivoice");
+  const [engine, setEngine] = useState("veena");
   const [job, setJob] = useState<Job | null>(null);
   const [speakers, setSpeakers] = useState<Speaker[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -69,7 +74,13 @@ export function App() {
   const [curTime, setCurTime] = useState(0);
   const [mediaBust, setMediaBust] = useState(0);
   const [activeSegmentText, setActiveSegmentText] = useState("");
+  const [showModelManager, setShowModelManager] = useState(false);
+  const [storageInfo, setStorageInfo] = useState<StorageInfo | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+
+  function refreshStorage() {
+    getStorageInfo().then(setStorageInfo).catch(() => void 0);
+  }
 
   function refreshHealth() {
     health().then(setHealth).catch(() => setHealth({}));
@@ -85,6 +96,7 @@ export function App() {
   useEffect(() => {
     refreshHealth();
     refreshJobs();
+    refreshStorage();
 
     const params = new URLSearchParams(window.location.search);
     const initialJobId = params.get("job");
@@ -221,6 +233,20 @@ export function App() {
         </div>
 
         <div className="topbar-controls">
+          <button
+            className="btn secondary model-storage-trigger-btn"
+            onClick={() => setShowModelManager(true)}
+            title="Manage AI Model Weights & Storage Drive"
+          >
+            <HardDrive size={15} />
+            <span>AI Models &amp; Storage</span>
+            {storageInfo && (
+              <span className={`badge-pill ${storageInfo.is_low_space ? "warning" : ""}`}>
+                {storageInfo.drive} {storageInfo.free_gb} GB free
+              </span>
+            )}
+          </button>
+
           <div className="health-badge-container">
             <span
               className={`health-dot ${health_.ok ? "live" : "offline"}`}
@@ -232,6 +258,7 @@ export function App() {
             onClick={() => {
               refreshHealth();
               refreshJobs();
+              refreshStorage();
             }}
             title="Refresh Studio Status"
           >
@@ -320,6 +347,22 @@ export function App() {
                 </select>
               </div>
             </div>
+
+            {lang === "hi" && (
+              <div className="engine-tip-banner">
+                <Sparkles size={14} className="tip-icon text-accent" />
+                <span className="tip-text">
+                  <strong>Recommended for Hindi:</strong> Maya Research's <strong>Veena</strong> model provides 4 distinct native Indian character voices (Kavya, Agastya, Maitri, Vinaya) with natural emotional prosody.
+                </span>
+                <button
+                  type="button"
+                  className="tip-action-btn"
+                  onClick={() => setShowModelManager(true)}
+                >
+                  Manage AI Models →
+                </button>
+              </div>
+            )}
 
             <div className="job-flags-row">
               <label className="checkbox-pill">
@@ -537,6 +580,12 @@ export function App() {
           </div>
         )}
       </main>
+
+      <ModelManagerModal
+        isOpen={showModelManager}
+        onClose={() => setShowModelManager(false)}
+        onModelsChanged={refreshStorage}
+      />
     </div>
   );
 }
