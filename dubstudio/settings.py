@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -43,7 +44,7 @@ class Settings(BaseSettings):
     )
     openai_api_key: str = Field(
         default="",
-        validation_alias=AliasChoices("DUBSTUDIO_OPENAI_API_KEY", "OPENAI_API_KEY"),
+        validation_alias=AliasChoices("DUBSTUDIO_OPENAI_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"),
     )
     openai_model: str = Field(
         default="gpt-4o-mini",
@@ -75,6 +76,14 @@ class Settings(BaseSettings):
     chunk_s: int = 30
     enable_rewrite_loop: bool = True
     enable_resume: bool = True
+
+    def model_post_init(self, __context: Any) -> None:
+        import os
+
+        if "openrouter" in self.openai_base_url.lower() or self.openai_api_key in {"local-bypass", "dummy", ""}:
+            router_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+            if router_key:
+                self.openai_api_key = router_key
 
     @property
     def jobs_dir(self) -> Path:

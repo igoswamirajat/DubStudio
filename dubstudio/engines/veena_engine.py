@@ -156,42 +156,45 @@ class VeenaEngine(VoiceEngine):
                     model = AutoModelForCausalLM.from_config(config)
                 replace_with_bnb_linear(model, quantization_config=quant)
 
-                # lm_head stays standard Linear sharing weights with embed_tokens
-                model.lm_head = torch.nn.Linear(
-                    config.hidden_size,
-                    config.vocab_size,
-                    bias=False,
-                    device=device,
-                    dtype=torch.bfloat16,
-                )
-
                 shards = sorted(glob.glob(os.path.join(model_path, "model-*.safetensors")))
                 if not shards:
                     raise FileNotFoundError(f"No safetensors shards found in {model_path}")
 
+                from safetensors import safe_open
+
                 for sf_path in shards:
                     log.info("Loading Veena shard: %s", os.path.basename(sf_path))
-                    tensors = safetensors.torch.load_file(sf_path, device="cpu")
-                    for full_name, tensor in tensors.items():
-                        if full_name.startswith("lm_head."):
-                            continue
-                        parts = full_name.split(".")
-                        parent = model
-                        for p in parts[:-1]:
-                            parent = getattr(parent, p)
-                        attr = parts[-1]
+                    with safe_open(sf_path, framework="pt", device="cpu") as f:
+                        for full_name in f.keys():
+                            if full_name.startswith("lm_head."):
+                                continue
+                            tensor = f.get_tensor(full_name)
+                            parts = full_name.split(".")
+                            parent = model
+                            for p in parts[:-1]:
+                                parent = getattr(parent, p)
+                            attr = parts[-1]
 
-                        if isinstance(parent, bnb.nn.Linear4bit) and attr == "weight":
-                            p4 = bnb.nn.Params4bit(tensor, requires_grad=False, quant_type="nf4").to(device)
-                            parent.weight = p4
-                        else:
-                            p_norm = torch.nn.Parameter(
-                                tensor.to(device, dtype=torch.bfloat16), requires_grad=False
-                            )
-                            setattr(parent, attr, p_norm)
-                    del tensors
+                            if isinstance(parent, bnb.nn.Linear4bit) and attr == "weight":
+                                p4 = bnb.nn.Params4bit(tensor, requires_grad=False, quant_type="nf4").to(device)
+                                parent.weight = p4
+                            else:
+                                p_norm = torch.nn.Parameter(
+                                    tensor.to(device, dtype=torch.bfloat16), requires_grad=False
+                                )
+                                setattr(parent, attr, p_norm)
+                            del tensor
+                    torch.cuda.empty_cache()
+                    gc.collect()
 
                 if config.tie_word_embeddings:
+                    model.lm_head = torch.nn.Linear(
+                        config.hidden_size,
+                        config.vocab_size,
+                        bias=False,
+                        device=device,
+                        dtype=torch.bfloat16,
+                    )
                     model.lm_head.weight = model.model.embed_tokens.weight
 
                 model.model.rotary_emb = LlamaRotaryEmbedding(config=config, device=device)
@@ -203,8 +206,8 @@ class VeenaEngine(VoiceEngine):
                     torch.cuda.memory_allocated() / (1024**3),
                 )
             except Exception as e:
-                log.exception("Custom 4-bit load failed (%s), falling back to standard from_pretrained", e)
-                self._model = None
+                log.exception("Custom 4-bit load failed: %s", e)
+                raise RuntimeError(f"Veena 4-bit CUDA initialization failed: {e}") from e
 
         if self._model is None:
             torch_dtype = (
@@ -274,6 +277,14 @@ class VeenaEngine(VoiceEngine):
         if not text:
             text = "..."
 
+        # Normalize technical terms and loan words into authentic Hindi phonetics
+        try:
+            from dubstudio.util.phonetics import normalize_hinglish
+
+            text = normalize_hinglish(text, req.language or "hi")
+        except Exception:
+            pass
+
         speaker = self._resolve_voice(req)
         log.info("Veena synthesis: speaker=%s text='%s'", speaker, text[:40])
 
@@ -299,9 +310,9 @@ class VeenaEngine(VoiceEngine):
                 input_ids,
                 max_new_tokens=max_tokens,
                 do_sample=True,
-                temperature=0.4,
-                top_p=0.9,
-                repetition_penalty=1.05,
+                temperature=0.65,
+                top_p=0.92,
+                repetition_penalty=1.08,
                 pad_token_id=self._tokenizer.pad_token_id,
                 eos_token_id=[END_OF_SPEECH_TOKEN, END_OF_AI_TOKEN],
             )

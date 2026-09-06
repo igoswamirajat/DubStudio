@@ -54,26 +54,29 @@ def _clean_llm_output(text: str) -> str:
 def _build_prompt(text: str, *, source: str, target: str, context: list[str], target_duration_ms: int) -> tuple[str, str]:
     src_name = _lang_name(source)
     tgt_name = _lang_name(target)
-    # Spoken budget: aim to FILL the original slot so the dub doesn't leave dead
-    # air. Target speakers pack ~13-15 chars/sec; use that as a fill target.
-    approx_chars = max(8, int(target_duration_ms / 1000 * 15))
+    target_sec = max(0.5, target_duration_ms / 1000.0)
+    # Native conversational tempo: ~2.5 - 3.0 words per second
+    max_words = max(3, int(target_sec * 2.8))
+
     system = (
-        f"You are an expert dubbing localizer adapting {src_name} speech into natural, "
-        f"conversational {tgt_name} for a voice-over. You are NOT a literal translator.\n"
-        "Rules:\n"
-        f"1. Convey the MEANING and intent the way a native {tgt_name} speaker would actually say it. "
-        "Never translate word-for-word. Rewrite idioms into their natural equivalent "
-        "(e.g. \"out of the box\" means ready-to-use, NOT a literal box).\n"
-        "2. Keep technical terms, product names, brand names, and common tech words in English "
-        "(e.g. Cloud Code, plugin, agent, GitHub, open source, AI, model, API). Do not force-translate them.\n"
-        "3. Match the tone/register of the original (casual, hype, formal) and keep it fluent and speakable.\n"
-        f"4. IMPORTANT — length: the spoken line must take about the SAME time as the original "
-        f"(roughly {approx_chars} characters). Do NOT make it shorter or clipped; a dub that is too "
-        "short leaves silent gaps. Naturally expand phrasing to fill the time without padding or repetition.\n"
-        f"5. Output ONLY the final {tgt_name} line — no quotes, no notes, no alternatives, no explanation."
+        f"You are a master voice dubbing localizer adapting {src_name} speech into conversational, "
+        f"natural {tgt_name} for video dubbing. You are NOT a literal translator.\n"
+        "Core Rules:\n"
+        f"1. Conversational Brevity & Rhythm: Match the spoken tempo and punchiness of the source line. "
+        f"The line must comfortably fit within {target_sec:.1f} seconds. Limit your translation to at most "
+        f"{max_words} words so the actor speaks naturally with breath pauses without rushing.\n"
+        "2. Meaning over Word-for-Word: Convey the core meaning the way a real speaker talks in casual conversation. "
+        "Do NOT use formal, bookish, or elongated sentence structures. Keep it concise, punchy, and modern.\n"
+        "3. Technical Terms & Loan Words: Adapt technical terms naturally for Indian speech "
+        "(e.g. use standard words like Python, GitHub, scrape, website, free, open source, AI, API).\n"
+        "4. Output ONLY the localized line — no quotes, no explanations, no notes."
     )
     ctx = "\n".join(context[-3:])
-    user = (f"Earlier lines already dubbed (context, do not translate again):\n{ctx}\n\n" if ctx else "") + f"Now adapt this line:\n{text}"
+    user = (
+        (f"Context from earlier dialogue:\n{ctx}\n\n" if ctx else "")
+        + f"Target duration: {target_sec:.1f}s (max {max_words} words)\n"
+        f"Adapt this line into concise conversational {tgt_name}:\n{text}"
+    )
     return system, user
 
 
@@ -102,6 +105,11 @@ def _ollama_translate(text: str, *, source: str, target: str, context: list[str]
         return None
 
 
+import logging
+
+log = logging.getLogger(__name__)
+
+
 def _openai_translate(text: str, *, source: str, target: str, context: list[str], target_duration_ms: int) -> str | None:
     """Any OpenAI-compatible chat API (OpenAI, Groq, DeepSeek, OpenRouter, Ollama /v1, ...)."""
     base = settings.openai_base_url.rstrip("/")
@@ -116,28 +124,49 @@ def _openai_translate(text: str, *, source: str, target: str, context: list[str]
             json={
                 "model": settings.openai_model,
                 "temperature": 0.3,
+                "max_tokens": 256,
                 "stream": False,
                 "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
             },
-            timeout=300.0,
+            timeout=45.0,
         )
         if r.status_code != 200:
+            log.warning("OpenAI translation returned HTTP %s: %s", r.status_code, r.text[:200])
             return None
         choices = r.json().get("choices") or []
         if not choices:
+            log.warning("OpenAI translation returned empty choices: %s", r.text[:200])
             return None
         content = _clean_llm_output((choices[0].get("message") or {}).get("content") or "")
         return content or None
-    except Exception:
+    except Exception as e:
+        log.warning("OpenAI translation call failed: %s", e)
         return None
 
 
-def translate_segments(segments: list[dict[str, Any]], *, source_language: str, target_language: str) -> list[dict[str, Any]]:
+def translate_segments(
+    segments: list[dict[str, Any]],
+    *,
+    source_language: str,
+    target_language: str,
+    job: dict | None = None,
+) -> list[dict[str, Any]]:
     context: list[str] = []
-    for seg in segments:
+    total = len(segments)
+    for i, seg in enumerate(segments):
+        if job and job.get("job_id") and total > 0:
+            try:
+                from dubstudio.jobs.store import store
+
+                pct = 58 + int((i / total) * 7)
+                job["percent"] = min(pct, 64)
+                job["message"] = f"Translating segment {i + 1}/{total}"
+                store.save(job)
+            except Exception:
+                pass
         text = seg.get("source_text") or ""
         translated = None
         dur = int(seg.get("target_duration_ms") or 2000)
@@ -146,7 +175,14 @@ def translate_segments(segments: list[dict[str, Any]], *, source_language: str, 
         elif settings.translator == "openai":
             translated = _openai_translate(text, source=source_language or "en", target=target_language, context=context, target_duration_ms=dur)
         if not translated:
+            log.warning("LLM translation failed for segment %s; using simple fallback map", seg.get("segment_id"))
             translated = _simple_map(text, target_language)
+        try:
+            from dubstudio.util.phonetics import normalize_hinglish
+
+            translated = normalize_hinglish(translated, target_language)
+        except Exception:
+            pass
         seg["translated_text"] = translated
         seg["status"] = "translated"
         context.append(f"{text} => {translated}")
@@ -157,6 +193,11 @@ def run_translation(job_dir: Path, job: dict) -> list[dict]:
     path = job_dir / "segments" / "segments.json"
     data = json.loads(path.read_text(encoding="utf-8"))
     segments = data if isinstance(data, list) else data.get("segments", [])
-    segments = translate_segments(segments, source_language=job.get("source_language") or "en", target_language=job.get("target_language") or "hi")
+    segments = translate_segments(
+        segments,
+        source_language=job.get("source_language") or "en",
+        target_language=job.get("target_language") or "hi",
+        job=job,
+    )
     path.write_text(json.dumps(segments, indent=2, ensure_ascii=False), encoding="utf-8")
     return segments

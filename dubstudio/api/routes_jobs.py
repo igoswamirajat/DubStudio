@@ -10,7 +10,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
 from ulid import ULID
 
-from dubstudio.jobs.runner import cancel, enqueue
+from dubstudio.jobs.runner import cancel, enqueue, is_active
+from dubstudio.jobs.states import PIPELINE_STAGES
 from dubstudio.jobs.store import store
 from dubstudio.settings import settings
 
@@ -75,9 +76,28 @@ async def create_job(
     return JSONResponse({"job_id": job_id, "state": "queued", "tts_engine": engine}, status_code=201)
 
 
+def _check_and_mark_orphan(job: dict) -> dict:
+    if job.get("state") in PIPELINE_STAGES and not is_active(job.get("job_id", "")):
+        try:
+            up = datetime.fromisoformat(job.get("updated_at") or "")
+            age = (datetime.now(timezone.utc) - up).total_seconds()
+        except Exception:
+            age = 999
+        if age > 45:
+            job["state"] = "failed"
+            job["error"] = "Processing was interrupted (process died or server restarted)"
+            job["message"] = "Interrupted. Click Retry to continue."
+            try:
+                store.save(job)
+            except Exception:
+                pass
+    return job
+
+
 @router.get("/jobs")
 def list_jobs():
-    return {"jobs": store.list()}
+    jobs = store.list()
+    return {"jobs": [_check_and_mark_orphan(j) for j in jobs]}
 
 
 @router.get("/jobs/{job_id}")
@@ -85,6 +105,7 @@ def get_job(job_id: str):
     job = store.get(job_id)
     if not job:
         raise HTTPException(404, {"error": {"code": "JOB_NOT_FOUND", "message": job_id}})
+    job = _check_and_mark_orphan(job)
     base = settings.jobs_dir / job_id
     has_output = (base / "export" / "output.mp4").is_file()
     src_dir = base / "source"

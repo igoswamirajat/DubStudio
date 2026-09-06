@@ -162,7 +162,7 @@ def run_job(job_id: str) -> dict:
     # --- timing fit ---
     _advance(job_id, "fitting", 85, "Fitting timing")
     if not done("fitting"):
-        run_timing(job_dir)
+        run_timing(job_dir, job)
         mark_done(job_dir, "fitting")
 
     # --- mixing ---

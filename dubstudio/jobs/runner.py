@@ -14,6 +14,11 @@ _gpu_lock = asyncio.Lock()
 _tasks: dict[str, asyncio.Task] = {}
 
 
+def is_active(job_id: str) -> bool:
+    t = _tasks.get(job_id)
+    return t is not None and not t.done()
+
+
 async def enqueue(job_id: str) -> None:
     job = store.get(job_id)
     if not job:

@@ -12,7 +12,7 @@ from dubstudio.engines.factory import get_voice_engine
 def test_default_engine_falls_back_to_dummy():
     eng = get_voice_engine()
     assert eng is not None
-    assert eng.name in {"dummy", "omnivoice", "chatterbox"}
+    assert eng.name in {"dummy", "omnivoice", "chatterbox", "veena"}
 
 
 def test_explicit_dummy():
