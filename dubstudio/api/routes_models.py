@@ -26,7 +26,7 @@ MODELS_CATALOG = [
         "badge": "SOTA Hindi TTS",
         "repo_id": "maya-research/veena",
         "extra_repos": ["hubertsiuzdak/snac_24khz"],
-        "size_mb": 3500,
+        "size_mb": 7200,
         "description": "3B transformer with 4 Indian character voices (Kavya, Agastya, Maitri, Vinaya) and SNAC 24kHz neural audio codec.",
     },
     {
@@ -192,8 +192,25 @@ def list_models():
         prog = DOWNLOAD_STATUS.get(m["id"])
         if prog and prog.get("status") == "downloading":
             m["status"] = "downloading"
-            m["progress"] = prog.get("percent", 0)
-            m["progress_message"] = prog.get("message", "Downloading...")
+            # Calculate actual downloaded bytes on disk in real time
+            hub_dir = storage_dir / "hub"
+            folder = hub_dir / f"models--{m['repo_id'].replace('/', '--')}"
+            dl_bytes = 0
+            if folder.is_dir():
+                dl_bytes += sum(f.stat().st_size for f in folder.rglob("*") if f.is_file())
+            for extra in m.get("extra_repos", []):
+                extra_folder = hub_dir / f"models--{extra.replace('/', '--')}"
+                if extra_folder.is_dir():
+                    dl_bytes += sum(f.stat().st_size for f in extra_folder.rglob("*") if f.is_file())
+
+            dl_mb = round(dl_bytes / (1024 * 1024), 1)
+            target_mb = max(1, m["size_mb"])
+            calc_pct = min(98, max(5, int((dl_mb / target_mb) * 100)))
+            m["progress"] = calc_pct
+            m["progress_message"] = f"Downloading {dl_mb:.0f} MB / ~{target_mb} MB ({calc_pct}%)"
+            # Keep global status synchronized
+            DOWNLOAD_STATUS[m["id"]]["percent"] = calc_pct
+            DOWNLOAD_STATUS[m["id"]]["message"] = m["progress_message"]
         elif is_dl:
             m["status"] = "downloaded"
             m["size_on_disk_mb"] = size_mb
