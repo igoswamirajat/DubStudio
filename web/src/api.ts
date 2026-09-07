@@ -195,6 +195,7 @@ export function subscribeJob(jobId: string, onJob: (job: Job) => void): () => vo
   es.addEventListener("progress", handle as EventListener);
   es.addEventListener("done", handle as EventListener);
   es.addEventListener("error", handle as EventListener);
+  es.addEventListener("voice_selection_required", handle as EventListener);
   return () => es.close();
 }
 
@@ -291,6 +292,66 @@ export async function downloadModel(model_id: string): Promise<{ status: string;
 
 export async function getModelDownloadProgress(): Promise<{ downloads: Record<string, Record<string, unknown>> }> {
   const res = await fetch(`${base}/models/download/progress`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export type VoiceOption = {
+  voice_id: string;
+  engine: string;
+  label: string;
+  description: string;
+  gender: string | null;
+  category: "clone" | "native" | "design";
+};
+
+export type SpeakerVoiceInfo = {
+  speaker_id: string;
+  label: string;
+  segment_count: number;
+  ref_audio_url: string;
+  auto_suggestion: {
+    voice_id: string;
+    confidence: number;
+  };
+  current_voice_id: string;
+  current_voice_mode: string;
+  gender?: string | null;
+  f0_median?: number | null;
+};
+
+export type VoiceOptionsResponse = {
+  job_state: string;
+  tts_engine: string;
+  speakers: SpeakerVoiceInfo[];
+  available_voices: VoiceOption[];
+};
+
+export async function getVoiceOptions(jobId: string): Promise<VoiceOptionsResponse> {
+  const res = await fetch(`${base}/jobs/${jobId}/voice-options`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function applyVoiceSelections(
+  jobId: string,
+  selections: Record<string, { voice_id: string; voice_mode: string; design_prompt?: string }>,
+): Promise<{ ok: boolean; state: string; job_id: string }> {
+  const res = await fetch(`${base}/jobs/${jobId}/voice-options/apply`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ selections }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function autoApplyVoiceSelections(
+  jobId: string,
+): Promise<{ ok: boolean; state: string; job_id: string }> {
+  const res = await fetch(`${base}/jobs/${jobId}/voice-options/auto-apply`, {
+    method: "POST",
+  });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }

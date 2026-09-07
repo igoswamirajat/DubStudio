@@ -28,6 +28,11 @@ def test_full_pipeline_produces_mp4_and_srt(clip_8s, job_workspace, monkeypatch)
     }
     store_mod.store.create(job)
     result = orch.run_job(job_id)
+    assert result["state"] == "awaiting_voice_selection"
+    assert result["percent"] == 67
+
+    # Resume synthesis phase (as user would via UI apply button)
+    result = orch.run_job_synthesis(job_id)
     assert result["state"] == "completed"
     assert result["percent"] == 100
     out_mp4 = job_dir / result["artifacts"]["output_mp4"]

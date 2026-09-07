@@ -52,6 +52,11 @@ const STAGES: { key: string; label: string; desc: string }[] = [
     desc: "Capturing vocal timbre reference per speaker",
   },
   {
+    key: "awaiting_voice_selection",
+    label: "Voice Choice",
+    desc: "Select preferred voice timbre for each speaker",
+  },
+  {
     key: "synthesizing",
     label: "Voice Synthesis",
     desc: "Synthesizing target speech with OmniVoice / neural TTS",
@@ -162,8 +167,8 @@ export function ProgressPanel({ job }: { job: Job }) {
           <Layers size={14} className="meta-icon" />
           <span>
             {job.stage_index
-              ? `Stage ${job.stage_index}/${job.stage_total || 12}`
-              : `${done ? "12/12 Stages" : "12 Stages"}`}
+              ? `Stage ${job.stage_index}/${job.stage_total || 13}`
+              : `${done ? "13/13 Stages" : "13 Stages"}`}
           </span>
           {active && (
             <>

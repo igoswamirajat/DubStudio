@@ -60,6 +60,7 @@ def _load_transcript(job_dir) -> dict | None:
 
 
 def run_job(job_id: str) -> dict:
+    """Run the analysis phase of the pipeline, then pause for voice selection."""
     job = store.get(job_id)
     if not job:
         raise KeyError(job_id)
@@ -148,6 +149,55 @@ def run_job(job_id: str) -> dict:
         job["speakers"] = speaker_map.get("speakers", [])
         store.save(job)
         mark_done(job_dir, "enrolling_voices")
+
+    # --- PAUSE: await voice selection ---
+    # Pipeline pauses here. The job thread exits, GPU lock is released.
+    # User selects voices in the UI, then POST /voice-options/apply triggers run_job_synthesis.
+    _advance(job_id, "awaiting_voice_selection", 67,
+             "Choose voices for each speaker to continue")
+    log.info("Job %s paused at awaiting_voice_selection — waiting for user input", job_id)
+    return store.get(job_id)
+
+
+def _apply_voice_selections(job_dir: Path) -> None:
+    """Re-read speaker_map.json (updated by user selections) and propagate voice_id to all segments."""
+    map_path = job_dir / "voices" / "speaker_map.json"
+    if not map_path.exists():
+        return
+    payload = json.loads(map_path.read_text(encoding="utf-8"))
+    speaker_voices = {s["speaker_id"]: s for s in payload.get("speakers", [])}
+
+    seg_path = job_dir / "segments" / "segments.json"
+    if not seg_path.exists():
+        return
+    segments = json.loads(seg_path.read_text(encoding="utf-8"))
+    for seg in segments:
+        sid = seg.get("speaker_id") or "S00"
+        sp = speaker_voices.get(sid, {})
+        if sp.get("voice_id"):
+            seg["voice_id"] = sp["voice_id"]
+        if sp.get("voice_mode"):
+            seg["voice_mode"] = sp["voice_mode"]
+    seg_path.write_text(json.dumps(segments, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def run_job_synthesis(job_id: str) -> dict:
+    """Resume pipeline after user selects voices — runs synthesis through export."""
+    job = store.get(job_id)
+    if not job:
+        raise KeyError(job_id)
+    job_dir = settings.jobs_dir / job_id
+
+    resume = bool(settings.enable_resume)
+
+    def done(stage: str) -> bool:
+        return resume and is_done(job_dir, stage)
+
+    # Re-propagate user's voice selections to segments
+    _apply_voice_selections(job_dir)
+
+    # Re-read duration_s
+    duration_s = float(job.get("duration_s") or 8.0)
 
     # --- synthesis ---
     _advance(job_id, "synthesizing", 75, "Generating target speech")

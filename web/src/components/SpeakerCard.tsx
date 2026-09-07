@@ -5,9 +5,16 @@ import { patchSpeaker, speakerRefUrl } from "../api";
 
 const MODES = [
   { id: "clone", label: "Clone Original", icon: Mic },
+  { id: "native", label: "Native Character", icon: UserCheck },
   { id: "design", label: "Design Voice", icon: Wand2 },
-  { id: "auto", label: "Auto Match", icon: Bot },
 ] as const;
+
+const VEENA_OPTIONS = [
+  { id: "agastya", label: "Agastya (♂ Tech Explainer)" },
+  { id: "vinaya", label: "Vinaya (♂ Deep Narrator)" },
+  { id: "kavya", label: "Kavya (♀ Bright Dynamic)" },
+  { id: "maitri", label: "Maitri (♀ Warm Conversational)" },
+];
 
 const PRESETS = [
   "male, deep narrator, calm tone",
@@ -26,6 +33,7 @@ export function SpeakerCard({ jobId, speaker, onChange }: Props) {
   const [busy, setBusy] = useState(false);
   const [label, setLabel] = useState(speaker.label || speaker.speaker_id);
   const [mode, setMode] = useState(speaker.voice_mode || "clone");
+  const [voiceId, setVoiceId] = useState(speaker.voice_id || "agastya");
   const [design, setDesign] = useState(speaker.design_prompt || "");
   const [err, setErr] = useState("");
 
@@ -102,6 +110,31 @@ export function SpeakerCard({ jobId, speaker, onChange }: Props) {
           );
         })}
       </div>
+
+      {/* Native Voice Selector Field */}
+      {mode === "native" && (
+        <div className="spk-design-section">
+          <label className="design-label">
+            <UserCheck size={12} /> Veena Character Voice
+          </label>
+          <select
+            className="design-input"
+            value={voiceId}
+            disabled={busy}
+            onChange={(e) => {
+              const vid = e.target.value;
+              setVoiceId(vid);
+              save({ voice_id: vid, voice_mode: "native" });
+            }}
+          >
+            {VEENA_OPTIONS.map((opt) => (
+              <option key={opt.id} value={opt.id}>
+                {opt.label}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
 
       {/* Voice Design Instruct Field */}
       {mode === "design" && (

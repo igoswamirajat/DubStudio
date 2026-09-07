@@ -85,7 +85,7 @@ class JobStore:
         In-flight tasks live only in memory, so any non-terminal job found at
         startup was interrupted and can never resume on its own.
         """
-        terminal = {"completed", "failed", "canceled", "created"}
+        terminal = {"completed", "failed", "canceled", "created", "awaiting_voice_selection"}
         recovered = 0
         for job in self.list(limit=1000):
             if job.get("state") not in terminal:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import logging
 
@@ -32,17 +33,29 @@ def _safe_save_job(job: dict) -> None:
 def run_synthesis(job_dir: Path, job: dict) -> list[dict]:
     path = job_dir / "segments" / "segments.json"
     segments = json.loads(path.read_text(encoding="utf-8"))
-    engine_name = job.get("tts_engine") or "veena"
-    engine = get_voice_engine(engine_name)
+    default_engine_name = job.get("tts_engine") or "veena"
     synth_dir = job_dir / "synth"
     synth_dir.mkdir(parents=True, exist_ok=True)
     lang = job.get("target_language") or "hi"
     speakers = _speaker_lookup(job_dir)
     total = len(segments)
 
-    log.info("Starting synthesis for job %s: %d segments with %s", job.get("job_id"), total, engine.name)
+    _engines: dict[str, Any] = {}
+
+    def _resolve_engine(v_mode: str, v_id: str):
+        if default_engine_name == "dummy":
+            target = "dummy"
+        elif v_mode in {"clone", "design"}:
+            target = "omnivoice"
+        else:
+            target = "veena"
+        if target not in _engines:
+            _engines[target] = get_voice_engine(target)
+        return _engines[target]
+
+    log.info("Starting synthesis for job %s: %d segments", job.get("job_id"), total)
     if job.get("job_id"):
-        job["message"] = f"Loading {engine.name.capitalize()} neural voice model on GPU..."
+        job["message"] = "Initializing neural voice synthesis..."
         _safe_save_job(job)
 
     for i, seg in enumerate(segments):
@@ -71,7 +84,15 @@ def run_synthesis(job_dir: Path, job: dict) -> list[dict]:
                 break
 
         text = seg.get("translated_text") or seg.get("source_text") or ""
-        log.info("Generating segment %d/%d (%s): '%s'", i + 1, total, seg.get("segment_id"), text[:40])
+        engine = _resolve_engine(voice_mode, voice_id)
+        log.info(
+            "Generating segment %d/%d (%s) with %s: '%s'",
+            i + 1,
+            total,
+            seg.get("segment_id"),
+            engine.name,
+            text[:40],
+        )
 
         result = engine.generate(
             SynthRequest(

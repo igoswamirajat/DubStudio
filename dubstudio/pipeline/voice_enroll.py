@@ -113,6 +113,12 @@ def run_enroll(job_dir: Path, speaker_overrides: dict | None = None, job: dict |
             "gender": m.get("gender"),
             "f0_median": m.get("f0_median"),
             "persona": m.get("persona"),
+            "auto_confidence": m.get("confidence", 0.75),
+            "auto_suggestion": {
+                "voice_id": m.get("voice_id", voice_id),
+                "voice_mode": m.get("voice_mode", voice_mode),
+                "confidence": m.get("confidence", 0.75),
+            },
             "design_prompt": design_prompt,
             "ref_text": ref_text,
             "ref_wav": s_info["ref_wav"],

@@ -73,7 +73,7 @@ class OmniVoiceEngine(VoiceEngine):
             self.model_id,
             device_map=device,
             dtype=dtype,
-            load_asr=True,
+            load_asr=False,
         )
         self.device_map = device
 

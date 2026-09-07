@@ -38,6 +38,7 @@ import { SegmentEditor } from "./components/SegmentEditor";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ProgressPanel } from "./components/ProgressPanel";
 import { ModelManagerModal } from "./components/ModelManagerModal";
+import { VoiceSelectionPanel } from "./components/VoiceSelectionPanel";
 
 const LANGS = [
   { id: "hi", label: "Hindi (हिन्दी)" },
@@ -51,8 +52,8 @@ const LANGS = [
 ];
 
 const ENGINES = [
-  { id: "veena", label: "Veena by Maya Research (SOTA Hindi & English)" },
-  { id: "omnivoice", label: "OmniVoice (Primary Neural Cloning)" },
+  { id: "omnivoice", label: "OmniVoice (Recommended — 100% Consistent Neural Cloning)" },
+  { id: "veena", label: "Veena by Maya Research (Experimental Indian Character Voices)" },
   { id: "dummy", label: "Dummy Engine (Fast CI / Mock)" },
 ];
 
@@ -64,7 +65,7 @@ export function App() {
   const [lang, setLang] = useState("hi");
   const [srcLang, setSrcLang] = useState("");
   const [skipSep, setSkipSep] = useState(false);
-  const [engine, setEngine] = useState("veena");
+  const [engine, setEngine] = useState("omnivoice");
   const [job, setJob] = useState<Job | null>(null);
   const [speakers, setSpeakers] = useState<Speaker[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -352,7 +353,7 @@ export function App() {
               <div className="engine-tip-banner">
                 <Sparkles size={14} className="tip-icon text-accent" />
                 <span className="tip-text">
-                  <strong>Recommended for Hindi:</strong> Maya Research's <strong>Veena</strong> model provides 4 distinct native Indian character voices (Kavya, Agastya, Maitri, Vinaya) with natural emotional prosody.
+                  <strong>Recommended:</strong> <strong>OmniVoice</strong> clones the presenter's exact vocal timbre, pitch, and gender with 100% consistency across all dialogue segments.
                 </span>
                 <button
                   type="button"
@@ -523,8 +524,20 @@ export function App() {
           </section>
         )}
 
-        {/* Speaker Enrollment & Voice Cloning Section */}
-        {safeSpeakers.length > 0 && job && (
+        {/* Human-in-the-Loop Voice Selection Panel */}
+        {job && job.state === "awaiting_voice_selection" && (
+          <VoiceSelectionPanel
+            jobId={job.job_id}
+            onApplied={async () => {
+              const updated = await getJob(job.job_id);
+              setJob(updated);
+              refreshJobs();
+            }}
+          />
+        )}
+
+        {/* Speaker Enrollment & Voice Cloning Section (Post-Completion & Custom Tuning) */}
+        {safeSpeakers.length > 0 && job && job.state !== "awaiting_voice_selection" && (
           <section className="studio-card speakers-section">
             <div className="section-header">
               <h2 className="section-title">

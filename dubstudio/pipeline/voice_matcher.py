@@ -113,6 +113,7 @@ def match_voices_for_job(
                 "gender": prof.gender,
                 "f0_median": prof.f0_median,
                 "persona": "cloned",
+                "confidence": 0.95,
             }
         return results
 
@@ -132,6 +133,7 @@ def match_voices_for_job(
                 "f0_median": profiles[sid].f0_median,
                 "persona": VEENA_VOICES[req_voice].persona,
                 "description": VEENA_VOICES[req_voice].description,
+                "confidence": 1.0,
             }
             assigned_voices.add(req_voice)
 
@@ -146,6 +148,7 @@ def match_voices_for_job(
             VEENA_VOICES.values(),
             key=lambda c: score_voice_match(prof, c),
         )
+        conf = round(min(0.99, max(0.50, score_voice_match(prof, best_candidate) / 100.0)), 2)
         results[sid] = {
             "voice_id": best_candidate.voice_id,
             "voice_mode": "native",
@@ -153,13 +156,15 @@ def match_voices_for_job(
             "f0_median": prof.f0_median,
             "persona": best_candidate.persona,
             "description": best_candidate.description,
+            "confidence": conf,
         }
         log.info(
-            "Single-speaker matched: [%s] -> %s (%s, %.1f Hz)",
+            "Single-speaker matched: [%s] -> %s (%s, %.1f Hz, conf=%.2f)",
             sid,
             best_candidate.voice_id,
             best_candidate.persona,
             prof.f0_median,
+            conf,
         )
         return results
 
@@ -192,6 +197,7 @@ def match_voices_for_job(
             chosen = candidates[0]
 
         assigned_voices.add(chosen.voice_id)
+        conf = round(min(0.99, max(0.50, score_voice_match(prof, chosen) / 100.0)), 2)
         results[sid] = {
             "voice_id": chosen.voice_id,
             "voice_mode": "native",
@@ -199,13 +205,15 @@ def match_voices_for_job(
             "f0_median": prof.f0_median,
             "persona": chosen.persona,
             "description": chosen.description,
+            "confidence": conf,
         }
         log.info(
-            "Multi-speaker matched: [%s] -> %s (%s, %.1f Hz)",
+            "Multi-speaker matched: [%s] -> %s (%s, %.1f Hz, conf=%.2f)",
             sid,
             chosen.voice_id,
             chosen.persona,
             prof.f0_median,
+            conf,
         )
 
     return results

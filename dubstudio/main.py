@@ -11,6 +11,7 @@ from dubstudio.api.routes_speakers import router as speakers_router
 from dubstudio.api.routes_segments import router as segments_router
 from dubstudio.api.routes_settings import router as settings_router
 from dubstudio.api.routes_models import router as models_router
+from dubstudio.api.routes_voice_selection import router as voice_selection_router
 from dubstudio.settings import settings
 
 _RESERVED = {"api", "docs", "redoc", "openapi.json", "assets"}
@@ -52,6 +53,7 @@ def create_app() -> FastAPI:
     app.include_router(segments_router, prefix="/api/v1")
     app.include_router(settings_router, prefix="/api/v1")
     app.include_router(models_router, prefix="/api/v1")
+    app.include_router(voice_selection_router, prefix="/api/v1")
 
     dist = Path(__file__).resolve().parent.parent / "web" / "dist"
     if dist.is_dir() and (dist / "index.html").exists():

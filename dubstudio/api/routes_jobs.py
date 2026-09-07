@@ -77,6 +77,9 @@ async def create_job(
 
 
 def _check_and_mark_orphan(job: dict) -> dict:
+    # Awaiting voice selection is a human-in-the-loop pause state, not an orphaned process
+    if job.get("state") == "awaiting_voice_selection":
+        return job
     if job.get("state") in PIPELINE_STAGES and not is_active(job.get("job_id", "")):
         try:
             up = datetime.fromisoformat(job.get("updated_at") or "")
@@ -226,8 +229,10 @@ async def events(job_id: str):
                     kind = "done"
                 elif job["state"] == "failed":
                     kind = "error"
+                elif job["state"] == "awaiting_voice_selection":
+                    kind = "voice_selection_required"
                 yield {"event": kind, "data": json.dumps(job, default=str)}
-                if kind in {"done", "error"}:
+                if kind in {"done", "error", "voice_selection_required"}:
                     break
             await asyncio.sleep(0.25)
 
