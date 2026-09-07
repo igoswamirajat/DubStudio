@@ -82,6 +82,53 @@ def _build_duck_envelope(
     return envelope
 
 
+def _compute_dynamic_gain(synth: np.ndarray, orig: np.ndarray, sr: int) -> np.ndarray:
+    """Compute time‑varying gain curve to match original energy contour.
+    
+    Uses a 50ms sliding window RMS ratio, smoothed with a 100ms moving average,
+    clamped to [0.6, 1.65] to avoid unnatural amplification.
+    """
+    if len(synth) == 0 or len(orig) == 0:
+        return np.ones_like(synth, dtype=np.float32)
+    
+    # Ensure both are mono and same length (trim to min length)
+    min_len = min(len(synth), len(orig))
+    synth = synth[:min_len]
+    orig = orig[:min_len]
+    
+    window = int(0.05 * sr)  # 50ms
+    hop = window // 2
+    
+    # Compute RMS in sliding windows
+    def rms_envelope(x, window, hop):
+        n = len(x)
+        frames = (n - window) // hop + 1
+        rms = np.zeros(frames, dtype=np.float32)
+        for i in range(frames):
+            start = i * hop
+            end = start + window
+            rms[i] = np.sqrt(np.mean(x[start:end]**2))
+        return rms
+    
+    synth_rms = rms_envelope(synth, window, hop)
+    orig_rms = rms_envelope(orig, window, hop)
+    
+    # Ratio, with protection
+    ratio = np.divide(orig_rms, synth_rms, out=np.ones_like(orig_rms), where=synth_rms > 1e-6)
+    ratio = np.clip(ratio, 0.6, 1.65)
+    
+    # Smooth with moving average (100ms)
+    smooth_window = int(0.1 * sr / hop)  # number of frames
+    if smooth_window > 1:
+        kernel = np.ones(smooth_window) / smooth_window
+        ratio = np.convolve(ratio, kernel, mode='same')
+    
+    # Interpolate back to sample rate
+    x_orig = np.linspace(0, 1, len(ratio), endpoint=False)
+    x_new = np.linspace(0, 1, min_len, endpoint=False)
+    gain_curve = np.interp(x_new, x_orig, ratio).astype(np.float32)
+    return gain_curve
+
 def _soft_limit(mix: np.ndarray, threshold: float = 0.88) -> np.ndarray:
     """Soft-knee peak limiter to prevent digital clipping without squash pumping."""
     peak = float(np.max(np.abs(mix))) if mix.size else 0.0
@@ -154,7 +201,7 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
                 max_samples = int(round(max_dur * sr))
                 audio = audio[:max_samples]
 
-        audio = apply_micro_fades(audio, fade_ms=5.0, sample_rate=sr)
+        audio = apply_micro_fades(audio, fade_ms=25.0, sample_rate=sr)
 
         # Dynamic Loudness & Emotion Matching:
         # Match the energy contour of the original speaker in this segment
@@ -166,9 +213,9 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
                 orig_rms = float(np.sqrt(np.mean(orig_slice ** 2)))
                 synth_rms = float(np.sqrt(np.mean(audio ** 2)))
                 if orig_rms > 1e-4 and synth_rms > 1e-4:
-                    # Clamped between 0.60 (-4.4 dB) and 1.65 (+4.3 dB) for safe, natural dynamics
-                    gain = float(np.clip(orig_rms / synth_rms, 0.60, 1.65))
-                    audio = audio * gain
+                    # Compute time‑varying gain curve to match original energy contour
+                    gain_curve = _compute_dynamic_gain(audio, orig_slice, sr)
+                    audio = audio * gain_curve
 
         i0 = int(round(start * sr))
         i1 = min(n, i0 + len(audio))
