@@ -5,7 +5,7 @@ import logging
 
 from dubstudio.jobs.states import require_transition, PIPELINE_STAGES
 from dubstudio.jobs.store import store
-from dubstudio.pipeline.checkpoint import is_done, mark_done
+from dubstudio.pipeline.checkpoint import clear_from, is_done, mark_done
 from dubstudio.pipeline.diarization import run_diarization
 from dubstudio.pipeline.export import run_export
 from dubstudio.pipeline.media import run_extract
@@ -192,6 +192,9 @@ def run_job_synthesis(job_id: str) -> dict:
 
     def done(stage: str) -> bool:
         return resume and is_done(job_dir, stage)
+
+    # Clear downstream checkpoints to guarantee a fresh synthesis pass with selected voices
+    clear_from(job_dir, "synthesizing")
 
     # Re-propagate user's voice selections to segments
     _apply_voice_selections(job_dir)

@@ -68,9 +68,10 @@ def run_synthesis(job_dir: Path, job: dict) -> list[dict]:
 
         out = synth_dir / f"{seg['segment_id']}.wav"
         sp = speakers.get(sid) or {}
-        voice_id = seg.get("voice_id") or sp.get("voice_id") or sid
-        voice_mode = seg.get("voice_mode") or sp.get("voice_mode") or "clone"
-        design_prompt = seg.get("design_prompt") or sp.get("design_prompt")
+        # User selection from speaker_map / overrides has highest priority
+        voice_id = sp.get("voice_id") or seg.get("voice_id") or sid
+        voice_mode = sp.get("voice_mode") or seg.get("voice_mode") or "native"
+        design_prompt = sp.get("design_prompt") or seg.get("design_prompt")
         ref_text = sp.get("ref_text")  # optional transcript of ref clip
 
         ref = None

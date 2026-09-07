@@ -42,9 +42,10 @@ def fit_segment(src: Path, dest: Path, target_ms: int, *, max_stretch: float = 0
             thresh = 10 ** (-42.0 / 20.0)  # -42 dB noise gate
             non_silent = np.where(np.abs(data) > thresh)[0]
             if len(non_silent) > 0:
-                pad = int(sr * 0.05)  # 50ms padding
-                start = max(0, non_silent[0] - pad)
-                end = min(len(data), non_silent[-1] + pad)
+                pad_start = int(sr * 0.05)  # 50ms lead-in padding
+                pad_end = int(sr * 0.15)    # 150ms trailing padding preserves breath & decaying vowels
+                start = max(0, non_silent[0] - pad_start)
+                end = min(len(data), non_silent[-1] + pad_end)
                 trimmed = data[start:end]
                 trimmed_ms = int(round(len(trimmed) / sr * 1000))
                 # Only use trimmed version if it trimmed dead air without cutting the line
@@ -62,31 +63,37 @@ def fit_segment(src: Path, dest: Path, target_ms: int, *, max_stretch: float = 0
 
     # If within 5%, leave natural rhythm untouched (no pitch/tempo artifacts)
     if 0.95 <= ratio <= 1.05:
+        applied = 1.0
         shutil.copy2(work_src, dest)
-        if temp_trimmed and temp_trimmed.exists():
-            temp_trimmed.unlink(missing_ok=True)
-        return {"stretch_ratio": 1.0, "generated_duration_ms": gen_ms, "fitted_duration_ms": gen_ms, "status": "ok"}
+    else:
+        applied = max(lo, min(hi, ratio))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        factors = _atempo_chain(applied)
+        filt = ",".join(f"atempo={f:.6f}" for f in factors)
+        cmd = ["ffmpeg", "-y", "-i", str(work_src), "-filter:a", filt, str(dest)]
+        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    applied = max(lo, min(hi, ratio))
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    factors = _atempo_chain(applied)
-    filt = ",".join(f"atempo={f:.6f}" for f in factors)
-    cmd = ["ffmpeg", "-y", "-i", str(work_src), "-filter:a", filt, str(dest)]
-    subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if temp_trimmed and temp_trimmed.exists():
         temp_trimmed.unlink(missing_ok=True)
 
+    # Always apply 10ms smooth micro-fades to eliminate boundary transients & clicks
     fitted = duration_ms(dest)
     try:
         from dubstudio.util.audio import apply_micro_fades, read_audio, write_wav
 
         data, sr = read_audio(dest, target_sr=48000, mono=True)
-        data = apply_micro_fades(data, fade_ms=5.0, sample_rate=sr)
+        data = apply_micro_fades(data, fade_ms=10.0, sample_rate=sr)
         write_wav(dest, data, sr)
         fitted = duration_ms(dest)
     except Exception:
         pass
-    return {"stretch_ratio": applied, "generated_duration_ms": gen_ms, "fitted_duration_ms": fitted, "status": "needs_stretch" if abs(1 - applied) > 0.01 else "ok"}
+
+    return {
+        "stretch_ratio": applied,
+        "generated_duration_ms": gen_ms,
+        "fitted_duration_ms": fitted,
+        "status": "needs_stretch" if abs(1 - applied) > 0.01 else "ok",
+    }
 
 
 def run_timing(job_dir: Path, job: dict | None = None) -> list[dict]:

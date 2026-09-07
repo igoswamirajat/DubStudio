@@ -14,13 +14,15 @@ def _build_duck_envelope(
     sr: int = 48000,
     duck_gain: float = 0.22,
     attack_s: float = 0.15,
-    release_s: float = 0.40,
+    hold_s: float = 0.12,
+    release_s: float = 0.45,
     bridge_gap_s: float = 0.35,
 ) -> np.ndarray:
     """Build a broadcast-quality smooth ducking envelope.
     
     Bridges pauses shorter than bridge_gap_s to eliminate accordion pumping,
-    and uses raised-cosine (S-curve) attack and release transitions.
+    uses raised-cosine (S-curve) attack and release transitions, and maintains
+    a gentle hold margin (hold_s) after dialogue finishes before ramping back up.
     """
     envelope = np.ones(n, dtype=np.float32)
     if not intervals:
@@ -41,13 +43,15 @@ def _build_duck_envelope(
             else:
                 merged.append([start, end])
 
-    # 2. Render smooth S-curve envelope
+    # 2. Render smooth S-curve envelope with hold margin
     att_samples = int(round(attack_s * sr))
+    hold_samples = int(round(hold_s * sr))
     rel_samples = int(round(release_s * sr))
 
     for start_s, end_s in merged:
         i0 = int(round(start_s * sr))
-        i1 = min(n, int(round(end_s * sr)))
+        # Extend hold region past speech end to prevent abrupt music jumps
+        i1 = min(n, int(round(end_s * sr)) + hold_samples)
         if i0 >= n or i1 <= 0:
             continue
 
@@ -63,7 +67,7 @@ def _build_duck_envelope(
                 curve = 1.0 - (1.0 - duck_gain) * (np.sin(t) ** 2)
                 envelope[a0:i0] = np.minimum(envelope[a0:i0], curve)
 
-        # Release transition (ramp up from duck_gain to 1.0)
+        # Release transition (ramp up from duck_gain to 1.0 after hold)
         if rel_samples > 0 and i1 < n:
             r1 = min(n, i1 + rel_samples)
             count = r1 - i1
@@ -123,6 +127,14 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
             continue
 
         audio, _ = read_mono(wav_path, target_sr=sr)
+        # Apply 10ms micro-fades to ensure smooth seamless segment placement
+        try:
+            from dubstudio.util.audio import apply_micro_fades
+
+            audio = apply_micro_fades(audio, fade_ms=10.0, sample_rate=sr)
+        except Exception:
+            pass
+
         start = float(seg.get("start", 0.0))
         i0 = int(round(start * sr))
         i1 = min(n, i0 + len(audio))
@@ -142,14 +154,15 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
         except Exception:
             pass
 
-    # 4. Generate Smooth Gap-Bridged Ducking Envelope
+    # 4. Generate Smooth Gap-Bridged Ducking Envelope with Broadcast Hold Margin
     duck = _build_duck_envelope(
         intervals=intervals,
         n=n,
         sr=sr,
         duck_gain=0.22,  # -13 dB ducking
-        attack_s=0.15,   # 150ms smooth S-curve attack
-        release_s=0.40,  # 400ms smooth S-curve release
+        attack_s=0.15,   # 150ms smooth S-curve lookahead attack
+        hold_s=0.12,     # 120ms broadcast hold after dialogue
+        release_s=0.45,  # 450ms smooth S-curve release
         bridge_gap_s=0.35,  # bridge pauses < 350ms
     )
 

@@ -63,6 +63,26 @@ def test_veena_request_resolves_or_falls_back():
         assert v_eng._resolve_voice(SynthRequest(text="hi", language="hi", voice_id="custom", instruct="male narrator", ref_wav=None)) == "agastya"
 
 
+def test_veena_male_pitch_anchoring():
+    import numpy as np
+    from dubstudio.engines.veena_engine import VeenaEngine, VEENA_SR
+
+    v_eng = VeenaEngine()
+    # Create a synthetic 220 Hz sine tone (typical female register)
+    duration = 0.5
+    t = np.linspace(0, duration, int(VEENA_SR * duration), endpoint=False)
+    high_pitch_audio = (0.5 * np.sin(2 * np.pi * 220.0 * t)).astype(np.float32)
+
+    # When speaker is kavya (female), high pitch should remain untouched
+    untouched = v_eng._anchor_pitch(high_pitch_audio, speaker="kavya", sr=VEENA_SR)
+    assert np.array_equal(untouched, high_pitch_audio)
+
+    # When speaker is agastya (male), pitch anchoring must shift it down
+    anchored = v_eng._anchor_pitch(high_pitch_audio, speaker="agastya", sr=VEENA_SR)
+    assert not np.array_equal(anchored, high_pitch_audio)
+    assert len(anchored) == len(high_pitch_audio)
+
+
 def test_unknown_engine_falls_back_to_dummy():
     eng = get_voice_engine("not_a_real_engine_xyz")
     assert eng.name == "dummy"

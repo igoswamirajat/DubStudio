@@ -275,6 +275,61 @@ class VeenaEngine(VoiceEngine):
 
         self.device_map = device
 
+    def _anchor_pitch(self, audio: np.ndarray, speaker: str, sr: int = VEENA_SR) -> np.ndarray:
+        """Dynamically anchor male voices (agastya/vinaya) into natural male register (110-130 Hz)."""
+        if speaker not in ("agastya", "vinaya") or len(audio) < int(sr * 0.3):
+            return audio
+
+        try:
+            import numpy as np
+            import torch
+            import torchaudio.functional as F
+
+            frame_len = int(sr * 0.04)
+            hop_len = int(sr * 0.02)
+            f0s = []
+            for i in range(0, len(audio) - frame_len, hop_len):
+                chunk = audio[i:i + frame_len]
+                if np.max(np.abs(chunk)) < 0.03:
+                    continue
+                corr = np.correlate(chunk, chunk, mode="full")[frame_len - 1:]
+                min_lag = int(sr / 400)
+                max_lag = int(sr / 70)
+                d = np.diff(corr)
+                starts = np.where(d > 0)[0]
+                if len(starts) > 0 and starts[0] < max_lag:
+                    peak = starts[0] + np.argmax(corr[starts[0]:max_lag])
+                    f0 = sr / peak
+                    if 70 <= f0 <= 380:
+                        f0s.append(f0)
+
+            if f0s:
+                median_f0 = float(np.median(f0s))
+                target_f0 = 130.0 if speaker == "agastya" else 110.0
+                # If synthesized voice drifted into female register (> 160 Hz)
+                if median_f0 > 160.0:
+                    semitones = int(round(12.0 * np.log2(target_f0 / median_f0)))
+                    if semitones <= -2:
+                        t = torch.tensor(audio, dtype=torch.float32).unsqueeze(0)
+                        orig_rms = float(np.sqrt(np.mean(audio ** 2)))
+                        shifted = F.pitch_shift(t, sr, semitones).squeeze(0).numpy()
+                        shift_rms = float(np.sqrt(np.mean(shifted ** 2)))
+                        if shift_rms > 1e-5 and orig_rms > 1e-5:
+                            shifted = shifted * (orig_rms / shift_rms)
+                        shifted = np.clip(shifted, -1.0, 1.0).astype(np.float32)
+                        log.info(
+                            "Anchored %s pitch: %.1f Hz -> target %.1f Hz (%d semitones)",
+                            speaker,
+                            median_f0,
+                            target_f0,
+                            semitones,
+                        )
+                        return shifted
+        except Exception as exc:
+            log.warning("Pitch anchoring failed for %s: %s", speaker, exc)
+
+        return audio
+
     def _resolve_voice(self, req: SynthRequest) -> str:
         """Map user request / speaker id / instruct to one of the 4 native voices."""
         # 1. Direct match in voice_id
@@ -302,32 +357,12 @@ class VeenaEngine(VoiceEngine):
             if detected == "female":
                 return "kavya"
 
-        # 5. Deterministic speaker ID mapping (S00 -> kavya, S01 -> agastya, etc.)
+        # 5. Deterministic speaker ID mapping (S00 -> kavya, S01 -> agastya, etc.) when no ref is provided
         if vid.startswith("s") and vid[1:].isdigit():
             idx = int(vid[1:]) % len(VOICE_CYCLE)
             return VOICE_CYCLE[idx]
 
-        return "kavya"
-
-    def generate(self, req: SynthRequest, out_wav: Path) -> SynthResult:
-        if self._model is None or self._snac_model is None or self._tokenizer is None:
-            self.warmup()
-
-        import numpy as np
-        import soundfile as sf
-        import torch
-
-        text = (req.text or "").strip()
-        if not text:
-            text = "..."
-
-        # Normalize technical terms and loan words into authentic Hindi phonetics
-        try:
-            from dubstudio.util.phonetics import normalize_hinglish
-
-            text = normalize_hinglish(text, req.language or "hi")
-        except Exception:
-            pass
+        return "agastya"
 
     def _generate_single(self, req: SynthRequest) -> np.ndarray:
         import hashlib
@@ -362,25 +397,25 @@ class VeenaEngine(VoiceEngine):
         device = next(self._model.parameters()).device
         input_ids = torch.tensor([input_tokens], device=device)
 
-        # Calculate calibrated max tokens based on text length and target duration
-        budget_text = int(len(text) * 1.35) * 7 + 28
-        if req.target_duration_ms and req.target_duration_ms > 0:
-            budget_dur = int((req.target_duration_ms / 1000.0) * 1.15 * 82)
-            max_tokens = min(budget_text, max(budget_dur, 70))
-        else:
-            max_tokens = budget_text
-        max_tokens = min(max_tokens, 750)
-        max_tokens = max(70, max_tokens - (max_tokens % 7))
+        # SNAC 24kHz generates at 200 tokens/sec. Provide generous token budget so speech
+        # NEVER truncates mid-sentence. Model naturally stops on END_OF_SPEECH_TOKEN.
+        token_count = max(350, int(len(text) * 4.0) * 7)
+        max_tokens = min(2048 - len(input_tokens) - 10, token_count)
+        max_tokens = max(140, max_tokens - (max_tokens % 7))
 
         stop_token_ids = [END_OF_SPEECH_TOKEN, END_OF_AI_TOKEN, 128009, 128001]
+
+        # Use slightly tighter temperature for male voices to prevent sampling high-pitch female tokens
+        temp = 0.28 if speaker in ("agastya", "vinaya") else 0.35
+        top_p = 0.85 if speaker in ("agastya", "vinaya") else 0.90
 
         with torch.no_grad():
             output = self._model.generate(
                 input_ids,
                 max_new_tokens=max_tokens,
                 do_sample=True,
-                temperature=0.35,
-                top_p=0.9,
+                temperature=temp,
+                top_p=top_p,
                 repetition_penalty=1.05,
                 pad_token_id=self._tokenizer.pad_token_id,
                 eos_token_id=stop_token_ids,
@@ -404,7 +439,10 @@ class VeenaEngine(VoiceEngine):
         if audio_samples is None or len(audio_samples) == 0:
             return np.zeros(int(VEENA_SR * 0.2), dtype=np.float32)
 
-        return np.asarray(audio_samples, dtype=np.float32)
+        raw_wave = np.asarray(audio_samples, dtype=np.float32)
+        # Apply intelligent male pitch anchoring to guarantee stable male pitch
+        anchored_wave = self._anchor_pitch(raw_wave, speaker=speaker, sr=VEENA_SR)
+        return anchored_wave
 
     def generate(self, req: SynthRequest, out_wav: Path) -> SynthResult:
         if self._model is None or self._snac_model is None or self._tokenizer is None:

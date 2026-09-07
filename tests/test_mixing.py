@@ -102,3 +102,18 @@ def test_run_mixing_stereo_bed_preservation(tmp_path: Path):
     # Output should preserve stereo 2 channels!
     assert final_audio.ndim == 2
     assert final_audio.shape[1] == 2
+
+
+def test_duck_envelope_hold_margin():
+    sr = 48000
+    n = int(3.0 * sr)
+    # Dialogue from 1.0s to 1.5s with 120ms hold margin
+    intervals = [(1.0, 1.5)]
+    env = _build_duck_envelope(intervals, n, sr=sr, duck_gain=0.22, hold_s=0.12, release_s=0.40)
+
+    # During dialogue
+    assert round(float(env[int(1.2 * sr)]), 2) == 0.22
+    # During the 120ms hold margin immediately after dialogue (at 1.56s)
+    assert round(float(env[int(1.56 * sr)]), 2) == 0.22
+    # Well after release (at 2.5s), should be fully restored to 1.0
+    assert round(float(env[int(2.5 * sr)]), 2) == 1.0

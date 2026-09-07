@@ -175,6 +175,19 @@ async def apply_voice_selections(job_id: str, body: ApplySelectionsBody):
         json.dumps(overrides, indent=2, ensure_ascii=False), encoding="utf-8"
     )
 
+    # Sync segments.json with chosen voice_id and voice_mode
+    seg_path = settings.jobs_dir / job_id / "segments" / "segments.json"
+    if seg_path.exists():
+        segments = json.loads(seg_path.read_text(encoding="utf-8"))
+        for seg in segments:
+            sid = seg.get("speaker_id") or "S00"
+            if sid in speakers:
+                seg["voice_id"] = speakers[sid].get("voice_id", sid)
+                seg["voice_mode"] = speakers[sid].get("voice_mode", "native")
+                if speakers[sid].get("design_prompt"):
+                    seg["design_prompt"] = speakers[sid]["design_prompt"]
+        seg_path.write_text(json.dumps(segments, indent=2, ensure_ascii=False), encoding="utf-8")
+
     # Sync speakers to job store
     job["speakers"] = payload["speakers"]
     store.save(job)
@@ -205,8 +218,20 @@ async def auto_apply_voice_selections(job_id: str):
             },
         )
 
-    # Keep existing speaker_map.json as-is (already has auto-matched voices)
-    # Just resume the pipeline
+    # Sync segments.json with speaker_map.json choices
+    payload = _load_map(job_id)
+    speaker_map = {s["speaker_id"]: s for s in payload.get("speakers", [])}
+    seg_path = settings.jobs_dir / job_id / "segments" / "segments.json"
+    if seg_path.exists():
+        segments = json.loads(seg_path.read_text(encoding="utf-8"))
+        for seg in segments:
+            sid = seg.get("speaker_id") or "S00"
+            if sid in speaker_map:
+                seg["voice_id"] = speaker_map[sid].get("voice_id", sid)
+                seg["voice_mode"] = speaker_map[sid].get("voice_mode", "native")
+        seg_path.write_text(json.dumps(segments, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # Resume pipeline
     await resume_synthesis(job_id)
 
     return {"ok": True, "state": "synthesizing", "job_id": job_id}
