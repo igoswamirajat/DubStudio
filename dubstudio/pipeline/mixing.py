@@ -242,8 +242,6 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
                 # Also update expected_len for consistency
                 expected_len = len(audio)
 
-        audio = apply_micro_fades(audio, fade_ms=25.0, sample_rate=sr)
-
         # Dynamic Loudness & Emotion Matching:
         # Match the energy contour of the original speaker in this segment
         if voc_mono is not None:
@@ -262,6 +260,9 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
                     # Compute time‑varying gain curve to match original energy contour
                     gain_curve = _compute_dynamic_gain(audio, orig_slice, sr)
                     audio = audio * gain_curve
+
+        # Apply micro‑fades after dynamic gain to smooth edges
+        audio = apply_micro_fades(audio, fade_ms=25.0, sample_rate=sr)
 
         i0 = int(round(start * sr))
         # Use the exact end time for placement, not the audio length
@@ -283,7 +284,7 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
     if chunks:
         # Sort by start time
         chunks.sort(key=lambda x: x[1])
-        crossfade_s = 0.020  # 20ms crossfade
+        crossfade_s = 0.080  # 80ms crossfade to bridge larger gaps
         crossfade_samples = int(round(crossfade_s * sr))
         
         # Build dialogue with crossfades
@@ -300,7 +301,7 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
                 gap_end = min(end, prev_end)
                 # If gap is within crossfade window, we crossfade the tail of previous and head of current
                 # Otherwise, we just place without crossfade (but we already have micro-fades)
-                if start < prev_end + crossfade_s:
+                if start < prev_end + crossfade_s * 2:  # bridge gaps up to 160ms
                     # There is overlap or small gap (< 20ms)
                     # We'll crossfade the overlapping or gap region
                     # Use the actual overlap if any, else extend previous and current into gap
