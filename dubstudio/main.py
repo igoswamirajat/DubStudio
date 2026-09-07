@@ -35,9 +35,9 @@ def create_app() -> FastAPI:
             os.environ[env_var] = str(d_temp)
         tempfile.tempdir = str(d_temp)
 
-    from dubstudio.jobs.store import store
+    import dubstudio.jobs.store as store_mod
 
-    store.recover_interrupted()
+    store_mod.store.recover_interrupted()
     app = FastAPI(title="DubStudio", version="0.9.0")
     # Local-first single-user: same-origin UI is served by this app, so CORS is
     # only needed for the Vite dev server. Restrict to loopback origins.

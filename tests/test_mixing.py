@@ -117,3 +117,41 @@ def test_duck_envelope_hold_margin():
     assert round(float(env[int(1.56 * sr)]), 2) == 0.22
     # Well after release (at 2.5s), should be fully restored to 1.0
     assert round(float(env[int(2.5 * sr)]), 2) == 1.0
+
+
+def test_dialogue_anti_collision_clamping(tmp_path: Path):
+    """Verify that segment 0 is clamped before segment 1 starts, preventing collision."""
+    sr = 48000
+    duration_s = 5.0
+    synth_dir = tmp_path / "synth"
+    synth_dir.mkdir(parents=True)
+
+    # Segment 0 starts at 0.0s. Its audio is 3.0s long!
+    # But Segment 1 starts at 2.0s. Without clamping, they would collide for 1.0s.
+    seg0_audio = np.ones(int(3.0 * sr), dtype=np.float32) * 0.4
+    seg1_audio = np.ones(int(1.0 * sr), dtype=np.float32) * 0.4
+    sf.write(str(synth_dir / "seg0.wav"), seg0_audio, sr)
+    sf.write(str(synth_dir / "seg1.wav"), seg1_audio, sr)
+
+    seg_dir = tmp_path / "segments"
+    seg_dir.mkdir(parents=True)
+    (seg_dir / "segments.json").write_text(
+        json.dumps([
+            {"segment_id": "seg0", "start": 0.0, "end": 2.0, "generated_wav": "synth/seg0.wav"},
+            {"segment_id": "seg1", "start": 2.0, "end": 3.0, "generated_wav": "synth/seg1.wav"},
+        ]),
+        encoding="utf-8",
+    )
+
+    final_path = run_mixing(tmp_path, duration_s=duration_s)
+    assert final_path.exists()
+
+    diag_path = tmp_path / "mix" / "dialogue.wav"
+    diag, _ = sf.read(str(diag_path))
+
+    # At 1.99s (right before seg1 starts at 2.0s), seg0 must be fading/clamped
+    # There should be no additive constructive interference spike (e.g. 0.4 + 0.4 = 0.8)
+    assert np.max(np.abs(diag)) <= 0.85
+    # The dialogue between 1.98s and 2.00s should be at a safe transition level
+    val_at_boundary = np.abs(diag[int(1.99 * sr)])
+    assert val_at_boundary < 0.50

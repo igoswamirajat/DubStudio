@@ -22,7 +22,7 @@ def _atempo_chain(ratio: float) -> list[str]:
     return factors
 
 
-def fit_segment(src: Path, dest: Path, target_ms: int, *, max_stretch: float = 0.12) -> dict:
+def fit_segment(src: Path, dest: Path, target_ms: int, *, max_stretch: float = 0.30) -> dict:
     gen_ms = duration_ms(src)
     if gen_ms <= 0:
         shutil.copy2(src, dest)
@@ -49,7 +49,7 @@ def fit_segment(src: Path, dest: Path, target_ms: int, *, max_stretch: float = 0
                 trimmed = data[start:end]
                 trimmed_ms = int(round(len(trimmed) / sr * 1000))
                 # Only use trimmed version if it trimmed dead air without cutting the line
-                if trimmed_ms >= target_ms * 0.9 and trimmed_ms < gen_ms:
+                if trimmed_ms >= target_ms * 0.85 and trimmed_ms < gen_ms:
                     temp_trimmed = dest.parent / f"{dest.stem}.trimmed.wav"
                     temp_trimmed.parent.mkdir(parents=True, exist_ok=True)
                     write_wav(temp_trimmed, trimmed, sr)
@@ -76,12 +76,15 @@ def fit_segment(src: Path, dest: Path, target_ms: int, *, max_stretch: float = 0
     if temp_trimmed and temp_trimmed.exists():
         temp_trimmed.unlink(missing_ok=True)
 
-    # Always apply 10ms smooth micro-fades to eliminate boundary transients & clicks
+    # Always apply smooth micro-fades and ensure audio doesn't overshoot target timeline slot
     fitted = duration_ms(dest)
     try:
         from dubstudio.util.audio import apply_micro_fades, read_audio, write_wav
 
         data, sr = read_audio(dest, target_sr=48000, mono=True)
+        max_samples = int(round((target_ms + 40) / 1000.0 * sr))
+        if len(data) > max_samples:
+            data = data[:max_samples]
         data = apply_micro_fades(data, fade_ms=10.0, sample_rate=sr)
         write_wav(dest, data, sr)
         fitted = duration_ms(dest)
@@ -118,7 +121,7 @@ def run_timing(job_dir: Path, job: dict | None = None) -> list[dict]:
             continue
         src = job_dir / gen_rel
         out = timing_dir / f"{seg['segment_id']}.fitted.wav"
-        info = fit_segment(src, out, int(seg.get("target_duration_ms") or 1000))
+        info = fit_segment(src, out, int(seg.get("target_duration_ms") or 1000), max_stretch=0.30)
         seg["fitted_wav"] = str(out.relative_to(job_dir))
         seg["generated_duration_ms"] = info["generated_duration_ms"]
         seg["fitted_duration_ms"] = info["fitted_duration_ms"]

@@ -349,15 +349,15 @@ class VeenaEngine(VoiceEngine):
         if "female" in inst:
             return "kavya"
 
-        # 4. Auto-detect gender from reference audio if available
+        # 4. Auto-detect gender from reference audio if explicitly available and reliable
         if req.ref_wav:
             detected = _detect_ref_gender(req.ref_wav)
-            if detected == "male":
-                return "agastya"
             if detected == "female":
                 return "kavya"
+            if detected == "male":
+                return "agastya"
 
-        # 5. Deterministic speaker ID mapping (S00 -> kavya, S01 -> agastya, etc.) when no ref is provided
+        # 5. Deterministic speaker ID mapping (S00 -> agastya, S01 -> kavya, etc.)
         if vid.startswith("s") and vid[1:].isdigit():
             idx = int(vid[1:]) % len(VOICE_CYCLE)
             return VOICE_CYCLE[idx]
@@ -365,7 +365,6 @@ class VeenaEngine(VoiceEngine):
         return "agastya"
 
     def _generate_single(self, req: SynthRequest) -> np.ndarray:
-        import hashlib
         import numpy as np
         import torch
 
@@ -374,14 +373,6 @@ class VeenaEngine(VoiceEngine):
             return np.zeros(int(VEENA_SR * 0.1), dtype=np.float32)
 
         speaker = self._resolve_voice(req)
-
-        # Character-anchored deterministic seeding guarantees 100% vocal timbre
-        # and pitch consistency across all segments for this character.
-        seed_key = f"{speaker}_{req.voice_id or ''}"
-        seed = int(hashlib.md5(seed_key.encode("utf-8")).hexdigest()[:8], 16)
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
 
         prompt = f"<spk_{speaker}> {text}"
         prompt_tokens = self._tokenizer.encode(prompt, add_special_tokens=False)
@@ -405,9 +396,10 @@ class VeenaEngine(VoiceEngine):
 
         stop_token_ids = [END_OF_SPEECH_TOKEN, END_OF_AI_TOKEN, 128009, 128001]
 
-        # Use slightly tighter temperature for male voices to prevent sampling high-pitch female tokens
-        temp = 0.28 if speaker in ("agastya", "vinaya") else 0.35
-        top_p = 0.85 if speaker in ("agastya", "vinaya") else 0.90
+        # Natural prosody & emotional cadence (Maya Research official parameters: temp 0.40, top_p 0.90)
+        # Avoid forcing low temperatures (<0.30) which causes flat, robotic, monotone cadence.
+        temp = 0.40
+        top_p = 0.90
 
         with torch.no_grad():
             output = self._model.generate(
@@ -440,9 +432,7 @@ class VeenaEngine(VoiceEngine):
             return np.zeros(int(VEENA_SR * 0.2), dtype=np.float32)
 
         raw_wave = np.asarray(audio_samples, dtype=np.float32)
-        # Apply intelligent male pitch anchoring to guarantee stable male pitch
-        anchored_wave = self._anchor_pitch(raw_wave, speaker=speaker, sr=VEENA_SR)
-        return anchored_wave
+        return raw_wave
 
     def generate(self, req: SynthRequest, out_wav: Path) -> SynthResult:
         if self._model is None or self._snac_model is None or self._tokenizer is None:
@@ -464,24 +454,26 @@ class VeenaEngine(VoiceEngine):
         except Exception:
             pass
 
-        # Split into natural sentence/clause chunks if text has punctuation and exceeds 50 chars
-        raw_sentences = [s.strip() for s in re.split(r"[।\.\!\?]+", text) if s.strip()]
-        clauses: list[str] = []
-        buf = ""
-        for s in raw_sentences:
-            if buf and (len(buf) + len(s) > 75):
+        # Generate each dialogue segment as a single fluid, unbroken utterance
+        # to prevent unnatural speech breaks, hiccups, and dead zero silences.
+        # Only break if text is exceptionally long (> 140 chars).
+        if len(text) > 140 and any(p in text for p in ("।", ".", "!", "?")):
+            raw_sentences = [s.strip() for s in re.split(r"[।\.\!\?]+", text) if s.strip()]
+            clauses: list[str] = []
+            buf = ""
+            for s in raw_sentences:
+                if buf and (len(buf) + len(s) > 90):
+                    clauses.append(buf.strip())
+                    buf = s
+                else:
+                    buf = f"{buf} {s}".strip() if buf else s
+            if buf:
                 clauses.append(buf.strip())
-                buf = s
-            else:
-                buf = f"{buf} {s}".strip() if buf else s
-        if buf:
-            clauses.append(buf.strip())
 
-        if len(clauses) > 1:
             waves: list[np.ndarray] = []
             target_total = req.target_duration_ms or 0
             total_len = max(1, sum(len(c) for c in clauses))
-            for idx, c in enumerate(clauses):
+            for c in clauses:
                 sub_target = int(target_total * (len(c) / total_len)) if target_total else None
                 sub_req = SynthRequest(
                     text=c,
@@ -497,10 +489,24 @@ class VeenaEngine(VoiceEngine):
                 )
                 w = self._generate_single(sub_req)
                 waves.append(w)
-                if idx < len(clauses) - 1:
-                    # Natural breath pause between sentences (80ms)
-                    waves.append(np.zeros(int(VEENA_SR * 0.08), dtype=np.float32))
-            wave = np.concatenate(waves)
+
+            # Stitch with a smooth 15ms raised-cosine crossfade (no digital zero dead silence)
+            xfade_samples = int(VEENA_SR * 0.015)
+            full_wave: list[float] = []
+            for idx, w in enumerate(waves):
+                if idx == 0:
+                    full_wave.extend(w.tolist())
+                else:
+                    # Apply crossfade over the junction
+                    t = np.linspace(0, 1, xfade_samples, dtype=np.float32)
+                    fade_in = 0.5 * (1 - np.cos(np.pi * t))
+                    fade_out = 1.0 - fade_in
+                    tail = np.array(full_wave[-xfade_samples:], dtype=np.float32)
+                    head = w[:xfade_samples]
+                    blended = tail * fade_out + head * fade_in
+                    full_wave[-xfade_samples:] = blended.tolist()
+                    full_wave.extend(w[xfade_samples:].tolist())
+            wave = np.asarray(full_wave, dtype=np.float32)
         else:
             single_req = SynthRequest(
                 text=text,

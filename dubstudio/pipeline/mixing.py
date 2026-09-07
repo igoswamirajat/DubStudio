@@ -114,11 +114,11 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
 
     is_stereo = bed.ndim > 1 and bed.shape[1] >= 2
 
-    # 2. Place Dialogue Segments & Record Timing Intervals
+    # 2. Place Dialogue Segments with Strict Anti-Collision Clamping
     dialogue = np.zeros(n, dtype=np.float32)
     intervals: list[tuple[float, float]] = []
 
-    for seg in segments:
+    for idx, seg in enumerate(segments):
         wav_rel = seg.get("fitted_wav") or seg.get("generated_wav")
         if not wav_rel:
             continue
@@ -127,6 +127,31 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
             continue
 
         audio, _ = read_mono(wav_path, target_sr=sr)
+        start = float(seg.get("start", 0.0))
+
+        # Look ahead to next segment start to guarantee zero dialogue collisions
+        next_start = None
+        for future_seg in segments[idx + 1 :]:
+            s_future = float(future_seg.get("start", 0.0))
+            if s_future > start + 0.05:
+                next_start = s_future
+                break
+
+        # If audio extends past next segment start, clamp it with a smooth 20ms micro-fade
+        if next_start is not None:
+            max_allowed_dur = max(0.2, next_start - start - 0.025)  # 25ms safety gap
+            max_allowed_samples = int(round(max_allowed_dur * sr))
+            if len(audio) > max_allowed_samples:
+                audio = audio[:max_allowed_samples]
+                fade_out_samples = min(len(audio), int(sr * 0.020))
+                if fade_out_samples > 0:
+                    t = np.linspace(0, np.pi / 2, fade_out_samples, dtype=np.float32)
+                    audio[-fade_out_samples:] *= np.cos(t) ** 2
+        else:
+            max_allowed_samples = n - int(round(start * sr))
+            if 0 < max_allowed_samples < len(audio):
+                audio = audio[:max_allowed_samples]
+
         # Apply 10ms micro-fades to ensure smooth seamless segment placement
         try:
             from dubstudio.util.audio import apply_micro_fades
@@ -135,7 +160,6 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
         except Exception:
             pass
 
-        start = float(seg.get("start", 0.0))
         i0 = int(round(start * sr))
         i1 = min(n, i0 + len(audio))
         if i0 >= n or i1 <= i0:
@@ -144,35 +168,68 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
         dialogue[i0:i1] += audio[: i1 - i0]
         intervals.append((start, start + (len(audio) / sr)))
 
-    # 3. Apply Subtle Dialogue High-Pass Filter (> 80 Hz) to eliminate low boominess
+    # 3. Apply Subtle Dialogue High-Pass Filter (> 85 Hz) & Broadcast Presence
     if np.any(dialogue != 0.0):
         try:
             from scipy.signal import butter, lfilter
 
-            b, a = butter(2, 80.0 / (sr / 2), btype="highpass")
+            b, a = butter(2, 85.0 / (sr / 2), btype="highpass")
             dialogue = lfilter(b, a, dialogue).astype(np.float32)
         except Exception:
             pass
 
+        # Broadcast vocal level matching (-1.5 dBFS peak)
+        diag_peak = float(np.max(np.abs(dialogue))) if dialogue.size else 0.0
+        if 0.01 < diag_peak < 0.65:
+            dialogue *= min(2.2, 0.82 / diag_peak)
+        elif diag_peak > 0.95:
+            dialogue *= (0.82 / diag_peak)
+
     # 4. Generate Smooth Gap-Bridged Ducking Envelope with Broadcast Hold Margin
-    duck = _build_duck_envelope(
+    # Envelope is 1.0 (unattenuated) and dips to duck_gain (0.22) during speech
+    duck_gain_ref = 0.22
+    duck_raw = _build_duck_envelope(
         intervals=intervals,
         n=n,
         sr=sr,
-        duck_gain=0.22,  # -13 dB ducking
-        attack_s=0.15,   # 150ms smooth S-curve lookahead attack
-        hold_s=0.12,     # 120ms broadcast hold after dialogue
-        release_s=0.45,  # 450ms smooth S-curve release
-        bridge_gap_s=0.35,  # bridge pauses < 350ms
+        duck_gain=duck_gain_ref,
+        attack_s=0.18,   # 180ms smooth S-curve lookahead attack
+        hold_s=0.15,     # 150ms broadcast hold after dialogue
+        release_s=0.50,  # 500ms smooth S-curve release
+        bridge_gap_s=0.40,  # bridge pauses < 400ms
     )
 
-    # 5. Composite Mix
+    # Calculate normalized speech activity intensity: 0.0 (no speech) -> 1.0 (full dialogue)
+    speech_intensity = np.clip((1.0 - duck_raw) / (1.0 - duck_gain_ref), 0.0, 1.0)
+
+    # 5. Frequency-Aware Spectral Ducking: Carve Vocal Pocket in Midrange (300Hz - 3.5kHz)
+    # This leaves the deep bass (<300Hz) and airy highs (>3.5kHz) alive and musical!
+    if np.any(bed != 0.0) and np.any(speech_intensity > 0.01):
+        try:
+            from scipy.signal import butter, sosfilt
+
+            sos_mid = butter(2, [300.0, 3500.0], btype="bandpass", fs=sr, output="sos")
+            if is_stereo:
+                mid_bed = np.column_stack([
+                    sosfilt(sos_mid, bed[:, 0]),
+                    sosfilt(sos_mid, bed[:, 1]),
+                ])
+                # Carve out a transparent 50% (-6 dB) pocket in the midrange during dialogue
+                bed = bed - (speech_intensity[:, None] * 0.50) * mid_bed
+            else:
+                mid_bed = sosfilt(sos_mid, bed)
+                bed = bed - (speech_intensity * 0.50) * mid_bed
+        except Exception:
+            pass
+
+    # Apply gentle broadband ducking (-3.5 dB, factor 0.67) to eliminate jarring volume pumping
+    broad_envelope = 1.0 - speech_intensity * 0.33
     if is_stereo:
-        ducked_bed = bed * duck[:, None]
+        ducked_bed = bed * broad_envelope[:, None]
         stereo_dialogue = np.column_stack([dialogue, dialogue])
         mix = ducked_bed + stereo_dialogue
     else:
-        ducked_bed = (bed.squeeze() if bed.ndim > 1 else bed) * duck
+        ducked_bed = (bed.squeeze() if bed.ndim > 1 else bed) * broad_envelope
         mix = ducked_bed + dialogue
 
     # 6. Apply Soft-Knee Limiter

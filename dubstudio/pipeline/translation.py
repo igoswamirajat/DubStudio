@@ -55,8 +55,8 @@ def _build_prompt(text: str, *, source: str, target: str, context: list[str], ta
     src_name = _lang_name(source)
     tgt_name = _lang_name(target)
     target_sec = max(0.5, target_duration_ms / 1000.0)
-    # Native conversational tempo: ~2.5 - 3.0 words per second
-    max_words = max(3, int(target_sec * 2.8))
+    # Native conversational tempo: ~2.2 - 2.5 words per second
+    max_words = max(3, int(target_sec * 2.4))
 
     system = (
         f"You are a master voice dubbing localizer adapting {src_name} speech into conversational, "
