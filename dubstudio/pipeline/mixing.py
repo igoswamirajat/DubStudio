@@ -279,12 +279,11 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
         dialogue[i0:i1] += audio
         intervals.append((start, end))
 
-    # 4. Crossfade adjacent chunks to eliminate level discontinuities
+    # 4. Crossfade adjacent chunks to eliminate level discontinuities (including gaps)
     if chunks:
         # Sort by start time
         chunks.sort(key=lambda x: x[1])
-        # Crossfade duration: 20ms (0.02s)
-        crossfade_s = 0.020
+        crossfade_s = 0.020  # 20ms crossfade
         crossfade_samples = int(round(crossfade_s * sr))
         
         # Build dialogue with crossfades
@@ -293,33 +292,50 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
             i1 = int(round(end * sr))
             if i0 >= n or i1 <= i0:
                 continue
-            # If this is not the first chunk, check overlap with previous
+            # If this is not the first chunk, crossfade with previous even if there's a gap
             if i > 0:
                 prev_start, prev_end = chunks[i-1][1], chunks[i-1][2]
-                # If current starts before previous ends + crossfade margin, we have overlap or small gap
+                # Determine overlap/gap region
+                gap_start = max(start, prev_start)
+                gap_end = min(end, prev_end)
+                # If gap is within crossfade window, we crossfade the tail of previous and head of current
+                # Otherwise, we just place without crossfade (but we already have micro-fades)
                 if start < prev_end + crossfade_s:
-                    overlap_start = max(start, prev_start)
-                    overlap_end = min(end, prev_end)
-                    # If there is actual overlap
-                    if overlap_end > overlap_start:
-                        # Compute overlap sample indices
-                        ov0 = int(round(overlap_start * sr))
-                        ov1 = int(round(overlap_end * sr))
+                    # There is overlap or small gap (< 20ms)
+                    # We'll crossfade the overlapping or gap region
+                    # Use the actual overlap if any, else extend previous and current into gap
+                    if start < prev_end:
+                        # Actual overlap
+                        ov_start = start
+                        ov_end = min(end, prev_end)
+                    else:
+                        # Gap: we bridge by fading out previous over the gap and fading in current
+                        # We'll create a fade-out of previous over the gap and fade-in of current
+                        ov_start = start
+                        ov_end = prev_end + crossfade_s
+                        # But we need to limit to current end and previous start
+                        ov_start = max(ov_start, prev_start)
+                        ov_end = min(ov_end, end)
+                        # If ov_end > ov_start, we have a region to crossfade
+                    if ov_end > ov_start:
+                        ov0 = int(round(ov_start * sr))
+                        ov1 = int(round(ov_end * sr))
                         if ov1 > ov0:
-                            # Get overlapping parts of current and previous
-                            # Previous audio overlap: from ov0 - prev_start to ov0 - prev_start + len(ov)
+                            # Get previous audio tail (from ov_start to prev_end or gap)
                             prev_audio = chunks[i-1][0]
-                            cur_audio = audio
-                            # Previous overlap slice
                             prev_ov_start = ov0 - int(round(prev_start * sr))
                             prev_ov_end = prev_ov_start + (ov1 - ov0)
+                            # If ov extends beyond prev audio, pad with zeros
                             if prev_ov_end <= len(prev_audio):
                                 prev_ov = prev_audio[prev_ov_start:prev_ov_end]
                             else:
+                                # Pad with zeros beyond prev audio length
                                 prev_ov = np.zeros(ov1 - ov0, dtype=np.float32)
-                            # Current overlap slice (starting at 0)
-                            cur_ov = cur_audio[:ov1 - ov0]
-                            # Ensure same length
+                                valid = max(0, len(prev_audio) - prev_ov_start)
+                                if valid > 0:
+                                    prev_ov[:valid] = prev_audio[prev_ov_start:prev_ov_start+valid]
+                            # Get current audio head
+                            cur_ov = audio[:ov1 - ov0]
                             if len(cur_ov) < ov1 - ov0:
                                 cur_ov = np.pad(cur_ov, (0, ov1 - ov0 - len(cur_ov)))
                             # Create raised-cosine crossfade
@@ -330,13 +346,10 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
                             mixed_ov = prev_ov * fade_out + cur_ov * fade_in
                             # Place mixed overlap into dialogue
                             dialogue[ov0:ov1] += mixed_ov
-                            # For the non-overlapping parts, we'll add later
-                            # Mark that we've handled overlap by trimming current audio
-                            # We'll add current after the overlap
-                            # But simpler: add previous fully, then add current with the overlap part zeroed out
-                            # Actually easier: we'll just add the overlap separately and then add the rest.
-                            # To avoid double adding, we'll zero out the overlap in the current audio before adding.
-                            cur_audio[:ov1 - ov0] = 0.0
+                            # Zero out the overlapping part in current audio to avoid double adding
+                            cur_audio = audio
+                            cur_audio[:len(cur_ov)] = 0.0
+                            audio = cur_audio
             # Add current chunk (with overlap zeroed if any)
             end_idx = i0 + len(audio)
             if end_idx > n:
@@ -345,7 +358,6 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
             if len(audio) > 0:
                 dialogue[i0:end_idx] += audio
     else:
-        # Fallback: no chunks (should not happen)
         dialogue = np.zeros(n, dtype=np.float32)
     
     # 5. Apply Subtle Dialogue High-Pass Filter (> 80 Hz) to eliminate low boominess
