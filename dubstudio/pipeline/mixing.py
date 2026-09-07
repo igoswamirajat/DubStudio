@@ -279,7 +279,76 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
         dialogue[i0:i1] += audio
         intervals.append((start, end))
 
-    # 4. Apply Subtle Dialogue High-Pass Filter (> 80 Hz) to eliminate low boominess
+    # 4. Crossfade adjacent chunks to eliminate level discontinuities
+    if chunks:
+        # Sort by start time
+        chunks.sort(key=lambda x: x[1])
+        # Crossfade duration: 20ms (0.02s)
+        crossfade_s = 0.020
+        crossfade_samples = int(round(crossfade_s * sr))
+        
+        # Build dialogue with crossfades
+        for i, (audio, start, end) in enumerate(chunks):
+            i0 = int(round(start * sr))
+            i1 = int(round(end * sr))
+            if i0 >= n or i1 <= i0:
+                continue
+            # If this is not the first chunk, check overlap with previous
+            if i > 0:
+                prev_start, prev_end = chunks[i-1][1], chunks[i-1][2]
+                # If current starts before previous ends + crossfade margin, we have overlap or small gap
+                if start < prev_end + crossfade_s:
+                    overlap_start = max(start, prev_start)
+                    overlap_end = min(end, prev_end)
+                    # If there is actual overlap
+                    if overlap_end > overlap_start:
+                        # Compute overlap sample indices
+                        ov0 = int(round(overlap_start * sr))
+                        ov1 = int(round(overlap_end * sr))
+                        if ov1 > ov0:
+                            # Get overlapping parts of current and previous
+                            # Previous audio overlap: from ov0 - prev_start to ov0 - prev_start + len(ov)
+                            prev_audio = chunks[i-1][0]
+                            cur_audio = audio
+                            # Previous overlap slice
+                            prev_ov_start = ov0 - int(round(prev_start * sr))
+                            prev_ov_end = prev_ov_start + (ov1 - ov0)
+                            if prev_ov_end <= len(prev_audio):
+                                prev_ov = prev_audio[prev_ov_start:prev_ov_end]
+                            else:
+                                prev_ov = np.zeros(ov1 - ov0, dtype=np.float32)
+                            # Current overlap slice (starting at 0)
+                            cur_ov = cur_audio[:ov1 - ov0]
+                            # Ensure same length
+                            if len(cur_ov) < ov1 - ov0:
+                                cur_ov = np.pad(cur_ov, (0, ov1 - ov0 - len(cur_ov)))
+                            # Create raised-cosine crossfade
+                            t = np.linspace(0, np.pi, ov1 - ov0, dtype=np.float32)
+                            fade_out = (np.cos(t) + 1) / 2  # 1 -> 0
+                            fade_in = (np.sin(t) + 1) / 2   # 0 -> 1
+                            # Mix overlap
+                            mixed_ov = prev_ov * fade_out + cur_ov * fade_in
+                            # Place mixed overlap into dialogue
+                            dialogue[ov0:ov1] += mixed_ov
+                            # For the non-overlapping parts, we'll add later
+                            # Mark that we've handled overlap by trimming current audio
+                            # We'll add current after the overlap
+                            # But simpler: add previous fully, then add current with the overlap part zeroed out
+                            # Actually easier: we'll just add the overlap separately and then add the rest.
+                            # To avoid double adding, we'll zero out the overlap in the current audio before adding.
+                            cur_audio[:ov1 - ov0] = 0.0
+            # Add current chunk (with overlap zeroed if any)
+            end_idx = i0 + len(audio)
+            if end_idx > n:
+                audio = audio[:n - i0]
+                end_idx = n
+            if len(audio) > 0:
+                dialogue[i0:end_idx] += audio
+    else:
+        # Fallback: no chunks (should not happen)
+        dialogue = np.zeros(n, dtype=np.float32)
+    
+    # 5. Apply Subtle Dialogue High-Pass Filter (> 80 Hz) to eliminate low boominess
     if np.any(dialogue != 0.0):
         try:
             from scipy.signal import butter, lfilter
@@ -289,7 +358,7 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
         except Exception:
             pass
 
-    # 5. Generate Smooth Gap-Bridged Ducking Envelope with Broadcast Hold Margin
+    # 6. Generate Smooth Gap-Bridged Ducking Envelope with Broadcast Hold Margin
     # Transparent -2.2 dB pocket (duck_gain = 0.78) maintains original music/SFX presence!
     duck = _build_duck_envelope(
         intervals=intervals,
@@ -302,7 +371,7 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
         bridge_gap_s=0.35,  # bridge pauses < 350ms
     )
 
-    # 6. Residual SFX & Non-Speech Vocalization Preservation ("Zero Missed Sounds")
+    # 7. Residual SFX & Non-Speech Vocalization Preservation ("Zero Missed Sounds")
     sfx_preserved = np.zeros_like(bed)
     if voc is not None:
         dia_abs = np.abs(dialogue)
@@ -332,7 +401,7 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
         else:
             sfx_preserved = (voc_stereo[:n].mean(axis=-1) * non_speech_mask[:n] * 0.85).astype(np.float32)
 
-    # 7. Composite Mix
+    # 8. Composite Mix
     if is_stereo:
         ducked_bed = bed * duck[:, None]
         stereo_dialogue = np.column_stack([dialogue, dialogue])
@@ -341,10 +410,10 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
         ducked_bed = (bed.squeeze() if bed.ndim > 1 else bed) * duck
         mix = ducked_bed + dialogue + sfx_preserved
 
-    # 8. Apply Soft-Knee Limiter
+    # 9. Apply Soft-Knee Limiter
     mix = _soft_limit(mix)
 
-    # 9. Write Artifacts
+    # 10. Write Artifacts
     mix_dir = job_dir / "mix"
     mix_dir.mkdir(parents=True, exist_ok=True)
     write_wav(mix_dir / "dialogue.wav", dialogue, sr)
