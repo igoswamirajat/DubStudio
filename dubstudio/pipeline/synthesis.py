@@ -58,6 +58,12 @@ def run_synthesis(job_dir: Path, job: dict) -> list[dict]:
         job["message"] = "Initializing neural voice synthesis..."
         _safe_save_job(job)
 
+    import concurrent.futures
+    import time
+
+    # Track if we've already fallen back to Veena
+    fallback_to_veena = False
+
     for i, seg in enumerate(segments):
         sid = seg.get("speaker_id") or "S00"
         if job.get("job_id") and total > 0:
@@ -71,10 +77,9 @@ def run_synthesis(job_dir: Path, job: dict) -> list[dict]:
         voice_id = seg.get("voice_id") or sp.get("voice_id") or sid
         voice_mode = seg.get("voice_mode") or sp.get("voice_mode") or "clone"
         design_prompt = seg.get("design_prompt") or sp.get("design_prompt")
-        ref_text = sp.get("ref_text")  # optional transcript of ref clip
+        ref_text = sp.get("ref_text")
 
         ref = None
-        # Prefer voices/<voice_id>/ref.wav, then voices/<sid>/ref.wav
         for candidate in (
             job_dir / "voices" / voice_id / "ref.wav",
             job_dir / "voices" / sid / "ref.wav",
@@ -84,7 +89,13 @@ def run_synthesis(job_dir: Path, job: dict) -> list[dict]:
                 break
 
         text = seg.get("translated_text") or seg.get("source_text") or ""
-        engine = _resolve_engine(voice_mode, voice_id)
+
+        # If fallback triggered, force Veena for this segment
+        if fallback_to_veena:
+            engine = get_voice_engine("veena")
+        else:
+            engine = _resolve_engine(voice_mode, voice_id)
+
         log.info(
             "Generating segment %d/%d (%s) with %s: '%s'",
             i + 1,
@@ -94,24 +105,93 @@ def run_synthesis(job_dir: Path, job: dict) -> list[dict]:
             text[:40],
         )
 
-        result = engine.generate(
-            SynthRequest(
-                text=text,
-                language=lang,
-                voice_id=voice_id,
-                ref_wav=ref,
-                voice_mode=voice_mode,
-                ref_text=ref_text,
-                instruct=design_prompt,
-                target_duration_ms=seg.get("target_duration_ms"),
-            ),
-            out,
-        )
+        # Use a timeout for generation
+        def _generate():
+            return engine.generate(
+                SynthRequest(
+                    text=text,
+                    language=lang,
+                    voice_id=voice_id,
+                    ref_wav=ref,
+                    voice_mode=voice_mode,
+                    ref_text=ref_text,
+                    instruct=design_prompt,
+                    target_duration_ms=seg.get("target_duration_ms"),
+                ),
+                out,
+            )
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_generate)
+                result = future.result(timeout=120)  # 120 seconds timeout
+        except concurrent.futures.TimeoutError:
+            log.error("Segment %d/%d timed out after 120s with %s", i+1, total, engine.name)
+            # If we're using OmniVoice, fallback to Veena for this and subsequent segments
+            if engine.name == "omnivoice" and not fallback_to_veena:
+                log.warning("Falling back to Veena engine for remaining segments")
+                fallback_to_veena = True
+                # Retry this segment with Veena
+                engine = get_voice_engine("veena")
+                try:
+                    result = engine.generate(
+                        SynthRequest(
+                            text=text,
+                            language=lang,
+                            voice_id=voice_id,
+                            ref_wav=ref,
+                            voice_mode="standard",  # Veena doesn't use clone mode
+                            ref_text=ref_text,
+                            instruct=design_prompt,
+                            target_duration_ms=seg.get("target_duration_ms"),
+                        ),
+                        out,
+                    )
+                except Exception as e2:
+                    log.error("Fallback Veena also failed for segment %d: %s", i+1, e2)
+                    seg["status"] = "failed"
+                    seg["error"] = str(e2)
+                    continue
+            else:
+                log.error("No fallback available, marking segment as failed")
+                seg["status"] = "failed"
+                seg["error"] = "Timeout"
+                continue
+        except Exception as e:
+            log.error("Segment %d/%d failed with %s: %s", i+1, total, engine.name, e)
+            if engine.name == "omnivoice" and not fallback_to_veena:
+                log.warning("Falling back to Veena engine for remaining segments")
+                fallback_to_veena = True
+                engine = get_voice_engine("veena")
+                try:
+                    result = engine.generate(
+                        SynthRequest(
+                            text=text,
+                            language=lang,
+                            voice_id=voice_id,
+                            ref_wav=ref,
+                            voice_mode="standard",
+                            ref_text=ref_text,
+                            instruct=design_prompt,
+                            target_duration_ms=seg.get("target_duration_ms"),
+                        ),
+                        out,
+                    )
+                except Exception as e2:
+                    log.error("Fallback Veena also failed: %s", e2)
+                    seg["status"] = "failed"
+                    seg["error"] = str(e2)
+                    continue
+            else:
+                seg["status"] = "failed"
+                seg["error"] = str(e)
+                continue
+
         seg["generated_wav"] = str(out.relative_to(job_dir))
         seg["generated_duration_ms"] = result.duration_ms
         seg["status"] = "synthesized"
         seg["tts_engine"] = result.engine
-        seg["voice_mode"] = voice_mode
+        seg["voice_mode"] = voice_mode if not fallback_to_veena else "standard"
         log.info("Segment %d/%d generated (%d ms)", i + 1, total, result.duration_ms)
 
     if job.get("job_id"):
