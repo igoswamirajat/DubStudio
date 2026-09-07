@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import numpy as np
 
-from dubstudio.util.audio import read_audio, read_mono, write_wav
+from dubstudio.util.audio import apply_micro_fades, read_audio, read_mono, write_wav
+
+log = logging.getLogger("dubstudio.mixing")
 
 
 def _build_duck_envelope(
     intervals: list[tuple[float, float]],
     n: int,
     sr: int = 48000,
-    duck_gain: float = 0.22,
+    duck_gain: float = 0.78,
     attack_s: float = 0.15,
     hold_s: float = 0.12,
     release_s: float = 0.45,
@@ -114,11 +117,24 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
 
     is_stereo = bed.ndim > 1 and bed.shape[1] >= 2
 
-    # 2. Place Dialogue Segments & Record Timing Intervals
+    # 2. Read Original Vocals Stem if available (for emotion matching & SFX restoration)
+    voc_path = job_dir / "audio" / "vocals.wav"
+    voc = None
+    voc_mono = None
+    if voc_path.exists():
+        try:
+            voc, _ = read_audio(voc_path, target_sr=sr, mono=False)
+            voc_mono = voc.mean(axis=-1) if voc.ndim > 1 else voc
+        except Exception as exc:
+            log.warning("Could not read vocals stem %s: %s", voc_path, exc)
+
+    # 3. Place Dialogue Segments with Dynamic Emotion & Loudness Matching
     dialogue = np.zeros(n, dtype=np.float32)
     intervals: list[tuple[float, float]] = []
 
-    for seg in segments:
+    sorted_segs = sorted(segments, key=lambda s: float(s.get("start", 0.0)))
+
+    for idx, seg in enumerate(sorted_segs):
         wav_rel = seg.get("fitted_wav") or seg.get("generated_wav")
         if not wav_rel:
             continue
@@ -128,6 +144,32 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
 
         audio, _ = read_mono(wav_path, target_sr=sr)
         start = float(seg.get("start", 0.0))
+        end = float(seg.get("end", start + len(audio) / sr))
+
+        # Anti-collision boundary check: clamp smoothly if overlapping next segment
+        if idx + 1 < len(sorted_segs):
+            next_start = float(sorted_segs[idx + 1].get("start", float("inf")))
+            max_dur = next_start - start
+            if max_dur > 0 and (len(audio) / sr) > max_dur:
+                max_samples = int(round(max_dur * sr))
+                audio = audio[:max_samples]
+
+        audio = apply_micro_fades(audio, fade_ms=5.0, sample_rate=sr)
+
+        # Dynamic Loudness & Emotion Matching:
+        # Match the energy contour of the original speaker in this segment
+        if voc_mono is not None:
+            orig_i0 = int(round(start * sr))
+            orig_i1 = min(len(voc_mono), int(round(end * sr)))
+            if orig_i1 > orig_i0:
+                orig_slice = voc_mono[orig_i0:orig_i1]
+                orig_rms = float(np.sqrt(np.mean(orig_slice ** 2)))
+                synth_rms = float(np.sqrt(np.mean(audio ** 2)))
+                if orig_rms > 1e-4 and synth_rms > 1e-4:
+                    # Clamped between 0.60 (-4.4 dB) and 1.65 (+4.3 dB) for safe, natural dynamics
+                    gain = float(np.clip(orig_rms / synth_rms, 0.60, 1.65))
+                    audio = audio * gain
+
         i0 = int(round(start * sr))
         i1 = min(n, i0 + len(audio))
         if i0 >= n or i1 <= i0:
@@ -136,7 +178,7 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
         dialogue[i0:i1] += audio[: i1 - i0]
         intervals.append((start, start + (len(audio) / sr)))
 
-    # 3. Apply Subtle Dialogue High-Pass Filter (> 80 Hz) to eliminate low boominess
+    # 4. Apply Subtle Dialogue High-Pass Filter (> 80 Hz) to eliminate low boominess
     if np.any(dialogue != 0.0):
         try:
             from scipy.signal import butter, lfilter
@@ -146,31 +188,62 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
         except Exception:
             pass
 
-    # 4. Generate Smooth Gap-Bridged Ducking Envelope with Broadcast Hold Margin
+    # 5. Generate Smooth Gap-Bridged Ducking Envelope with Broadcast Hold Margin
+    # Transparent -2.2 dB pocket (duck_gain = 0.78) maintains original music/SFX presence!
     duck = _build_duck_envelope(
         intervals=intervals,
         n=n,
         sr=sr,
-        duck_gain=0.22,  # -13 dB ducking
+        duck_gain=0.78,  # -2.2 dB transparent vocal pocket
         attack_s=0.15,   # 150ms smooth S-curve lookahead attack
         hold_s=0.12,     # 120ms broadcast hold after dialogue
         release_s=0.45,  # 450ms smooth S-curve release
         bridge_gap_s=0.35,  # bridge pauses < 350ms
     )
 
-    # 5. Composite Mix
+    # 6. Residual SFX & Non-Speech Vocalization Preservation ("Zero Missed Sounds")
+    sfx_preserved = np.zeros_like(bed)
+    if voc is not None:
+        dia_abs = np.abs(dialogue)
+        smooth_win = int(sr * 0.05)  # 50ms smoothing window
+        if len(dialogue) > smooth_win:
+            dia_active = np.convolve(
+                (dia_abs > 0.015).astype(np.float32),
+                np.ones(smooth_win) / smooth_win,
+                mode="same",
+            ) > 0.01
+        else:
+            dia_active = (dia_abs > 0.015).astype(np.float32)
+
+        non_speech_mask = 1.0 - dia_active.astype(np.float32)
+        voc_stereo = voc if voc.ndim > 1 else np.column_stack([voc, voc])
+        if len(voc_stereo) < n:
+            voc_stereo = np.pad(
+                voc_stereo,
+                ((0, n - len(voc_stereo)), (0, 0)) if voc_stereo.ndim > 1 else (0, n - len(voc_stereo)),
+            )[:n]
+        else:
+            voc_stereo = voc_stereo[:n]
+
+        # In pause intervals, restore original sounds/SFX/reactions (e.g. laughter, breath, chimes)
+        if is_stereo:
+            sfx_preserved = (voc_stereo[:n, :2] * non_speech_mask[:n, None] * 0.85).astype(np.float32)
+        else:
+            sfx_preserved = (voc_stereo[:n].mean(axis=-1) * non_speech_mask[:n] * 0.85).astype(np.float32)
+
+    # 7. Composite Mix
     if is_stereo:
         ducked_bed = bed * duck[:, None]
         stereo_dialogue = np.column_stack([dialogue, dialogue])
-        mix = ducked_bed + stereo_dialogue
+        mix = ducked_bed + stereo_dialogue + sfx_preserved
     else:
         ducked_bed = (bed.squeeze() if bed.ndim > 1 else bed) * duck
-        mix = ducked_bed + dialogue
+        mix = ducked_bed + dialogue + sfx_preserved
 
-    # 6. Apply Soft-Knee Limiter
+    # 8. Apply Soft-Knee Limiter
     mix = _soft_limit(mix)
 
-    # 7. Write Artifacts
+    # 9. Write Artifacts
     mix_dir = job_dir / "mix"
     mix_dir.mkdir(parents=True, exist_ok=True)
     write_wav(mix_dir / "dialogue.wav", dialogue, sr)

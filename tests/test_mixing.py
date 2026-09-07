@@ -155,3 +155,84 @@ def test_dialogue_anti_collision_clamping(tmp_path: Path):
     # The dialogue between 1.98s and 2.00s should be at a safe transition level
     val_at_boundary = np.abs(diag[int(1.99 * sr)])
     assert val_at_boundary < 0.50
+
+
+def test_dynamic_emotion_and_loudness_matching(tmp_path: Path):
+    """Verify that synthesized dialogue dynamically scales to match the original speaker's emotional volume."""
+    sr = 48000
+    duration_s = 4.0
+    n = int(duration_s * sr)
+
+    audio_dir = tmp_path / "audio"
+    audio_dir.mkdir(parents=True)
+    t_full = np.linspace(0, duration_s, n, endpoint=False, dtype=np.float32)
+    carrier = np.sin(2 * np.pi * 220 * t_full).astype(np.float32)
+
+    # Original vocals: Segment 0 (0-1s) is loud (0.50), Segment 1 (2-3s) is quiet whisper (0.10)
+    voc = np.zeros(n, dtype=np.float32)
+    voc[int(0.0 * sr) : int(1.0 * sr)] = carrier[int(0.0 * sr) : int(1.0 * sr)] * 0.50
+    voc[int(2.0 * sr) : int(3.0 * sr)] = carrier[int(2.0 * sr) : int(3.0 * sr)] * 0.10
+    sf.write(str(audio_dir / "vocals.wav"), voc, sr)
+
+    synth_dir = tmp_path / "synth"
+    synth_dir.mkdir(parents=True)
+    # Synthesized speech is flat at 0.25 for both segments
+    t_seg = np.linspace(0, 1.0, int(1.0 * sr), endpoint=False, dtype=np.float32)
+    synth_audio = (np.sin(2 * np.pi * 220 * t_seg) * 0.25).astype(np.float32)
+    sf.write(str(synth_dir / "seg0.wav"), synth_audio, sr)
+    sf.write(str(synth_dir / "seg1.wav"), synth_audio, sr)
+
+    seg_dir = tmp_path / "segments"
+    seg_dir.mkdir(parents=True)
+    (seg_dir / "segments.json").write_text(
+        json.dumps([
+            {"segment_id": "seg0", "start": 0.0, "end": 1.0, "generated_wav": "synth/seg0.wav"},
+            {"segment_id": "seg1", "start": 2.0, "end": 3.0, "generated_wav": "synth/seg1.wav"},
+        ]),
+        encoding="utf-8",
+    )
+
+    run_mixing(tmp_path, duration_s=duration_s)
+    diag, _ = sf.read(str(tmp_path / "mix" / "dialogue.wav"))
+
+    rms_seg0 = float(np.sqrt(np.mean(diag[int(0.2 * sr) : int(0.8 * sr)] ** 2)))
+    rms_seg1 = float(np.sqrt(np.mean(diag[int(2.2 * sr) : int(2.8 * sr)] ** 2)))
+
+    # Segment 0 must be significantly louder than Segment 1, reflecting the original vocal emotion!
+    assert rms_seg0 > rms_seg1 * 1.8
+
+
+def test_non_speech_sfx_preservation(tmp_path: Path):
+    """Verify that non-speech sounds (SFX, laughter, chimes) during pauses are preserved in the final mix."""
+    sr = 48000
+    duration_s = 3.0
+    n = int(duration_s * sr)
+
+    audio_dir = tmp_path / "audio"
+    audio_dir.mkdir(parents=True)
+    # Original vocals has a distinct SFX/chime at 0.2s - 0.5s
+    voc = np.zeros(n, dtype=np.float32)
+    voc[int(0.2 * sr) : int(0.5 * sr)] = 0.45
+    sf.write(str(audio_dir / "vocals.wav"), voc, sr)
+
+    synth_dir = tmp_path / "synth"
+    synth_dir.mkdir(parents=True)
+    # Dialogue only begins at 1.5s
+    dia_audio = np.ones(int(1.0 * sr), dtype=np.float32) * 0.30
+    sf.write(str(synth_dir / "seg0.wav"), dia_audio, sr)
+
+    seg_dir = tmp_path / "segments"
+    seg_dir.mkdir(parents=True)
+    (seg_dir / "segments.json").write_text(
+        json.dumps([
+            {"segment_id": "seg0", "start": 1.5, "end": 2.5, "generated_wav": "synth/seg0.wav"},
+        ]),
+        encoding="utf-8",
+    )
+
+    final_path = run_mixing(tmp_path, duration_s=duration_s)
+    mix, _ = sf.read(str(final_path))
+
+    # At 0.3s (during the original SFX, when dialogue is 0), audio must be present!
+    sfx_energy = float(np.sqrt(np.mean(mix[int(0.25 * sr) : int(0.45 * sr)] ** 2)))
+    assert sfx_energy > 0.20
