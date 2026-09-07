@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 import shutil
 from datetime import datetime, timezone
 
@@ -237,3 +238,21 @@ async def events(job_id: str):
             await asyncio.sleep(0.25)
 
     return EventSourceResponse(gen())
+
+
+@router.get("/preview/{name}")
+@router.head("/preview/{name}")
+def preview_file(name: str):
+    safe_name = Path(name).name
+    if not safe_name.endswith(".mp4"):
+        raise HTTPException(400, "Only MP4 preview is supported")
+    project_root = Path(__file__).resolve().parent.parent.parent
+    path = project_root / safe_name
+    if not path.is_file():
+        raise HTTPException(404, f"Preview file {safe_name} not found")
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        content_disposition_type="inline",
+        headers={"Accept-Ranges": "bytes"},
+    )
