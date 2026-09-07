@@ -85,6 +85,9 @@ class OmniVoiceEngine(VoiceEngine):
         import soundfile as sf
 
         text = (req.text or "").strip() or "."
+        if not text:
+            raise ValueError("Empty text provided to OmniVoice generation")
+
         kwargs: dict = {"text": text}
         mode = (req.voice_mode or "clone").lower()
 
@@ -107,7 +110,15 @@ class OmniVoiceEngine(VoiceEngine):
             kwargs.setdefault("language", req.language)
 
         log.debug("OmniVoice generate mode=%s keys=%s", mode, list(kwargs.keys()))
-        audio = self._model.generate(**kwargs)
+        
+        try:
+            audio = self._model.generate(**kwargs)
+        except Exception as e:
+            log.error("OmniVoice generation failed: %s", e)
+            raise RuntimeError(f"OmniVoice generation failed: {e}") from e
+
+        if audio is None:
+            raise RuntimeError("OmniVoice returned None (generation failed)")
 
         if isinstance(audio, (list, tuple)):
             wave = audio[0]
@@ -116,6 +127,9 @@ class OmniVoiceEngine(VoiceEngine):
         wave = np.asarray(wave, dtype=np.float32)
         if wave.ndim > 1:
             wave = wave.mean(axis=-1)
+
+        if len(wave) == 0:
+            raise RuntimeError("OmniVoice generated empty audio")
 
         out_wav = Path(out_wav)
         out_wav.parent.mkdir(parents=True, exist_ok=True)
