@@ -282,82 +282,70 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
 
     # 4. Crossfade adjacent chunks to eliminate level discontinuities (including gaps)
     if chunks:
-        # Sort by start time
         chunks.sort(key=lambda x: x[1])
-        crossfade_s = 0.080  # 80ms crossfade to bridge larger gaps
-        crossfade_samples = int(round(crossfade_s * sr))
+        crossfade_s = 0.040   # 40ms crossfade window
+        bridge_gap_s = 0.080  # bridge gaps up to 80ms
         
-        # Build dialogue with crossfades
-        for i, (audio, start, end) in enumerate(chunks):
+        dialogue = np.zeros(n, dtype=np.float32)
+        prev_chunk = None
+        
+        for idx, (audio, start, end) in enumerate(chunks):
             i0 = int(round(start * sr))
             i1 = int(round(end * sr))
             if i0 >= n or i1 <= i0:
                 continue
-            # If this is not the first chunk, crossfade with previous even if there's a gap
-            if i > 0:
-                prev_start, prev_end = chunks[i-1][1], chunks[i-1][2]
-                # Determine overlap/gap region
-                gap_start = max(start, prev_start)
-                gap_end = min(end, prev_end)
-                # If gap is within crossfade window, we crossfade the tail of previous and head of current
-                # Otherwise, we just place without crossfade (but we already have micro-fades)
-                if start < prev_end + crossfade_s * 2:  # bridge gaps up to 160ms
-                    # There is overlap or small gap (< 20ms)
-                    # We'll crossfade the overlapping or gap region
-                    # Use the actual overlap if any, else extend previous and current into gap
-                    if start < prev_end:
-                        # Actual overlap
-                        ov_start = start
-                        ov_end = min(end, prev_end)
-                    else:
-                        # Gap: we bridge by fading out previous over the gap and fading in current
-                        # We'll create a fade-out of previous over the gap and fade-in of current
-                        ov_start = start
-                        ov_end = prev_end + crossfade_s
-                        # But we need to limit to current end and previous start
-                        ov_start = max(ov_start, prev_start)
-                        ov_end = min(ov_end, end)
-                        # If ov_end > ov_start, we have a region to crossfade
-                    if ov_end > ov_start:
-                        ov0 = int(round(ov_start * sr))
-                        ov1 = int(round(ov_end * sr))
-                        if ov1 > ov0:
-                            # Get previous audio tail (from ov_start to prev_end or gap)
-                            prev_audio = chunks[i-1][0]
-                            prev_ov_start = ov0 - int(round(prev_start * sr))
-                            prev_ov_end = prev_ov_start + (ov1 - ov0)
-                            # If ov extends beyond prev audio, pad with zeros
+            
+            if prev_chunk is not None:
+                prev_start, prev_end = prev_chunk[1], prev_chunk[2]
+                gap = start - prev_end
+                
+                if gap < bridge_gap_s:
+                    # Crossfade the tail of prev_chunk with the head of current
+                    cf_start = max(prev_start, prev_end - crossfade_s)
+                    cf_end = min(end, start + crossfade_s)
+                    if cf_end > cf_start:
+                        cf0 = int(round(cf_start * sr))
+                        cf1 = int(round(cf_end * sr))
+                        if cf1 > cf0:
+                            # Previous audio tail
+                            prev_audio = prev_chunk[0]
+                            prev_ov_start = cf0 - int(round(prev_start * sr))
+                            prev_ov_end = prev_ov_start + (cf1 - cf0)
                             if prev_ov_end <= len(prev_audio):
                                 prev_ov = prev_audio[prev_ov_start:prev_ov_end]
                             else:
-                                # Pad with zeros beyond prev audio length
-                                prev_ov = np.zeros(ov1 - ov0, dtype=np.float32)
+                                prev_ov = np.zeros(cf1 - cf0, dtype=np.float32)
                                 valid = max(0, len(prev_audio) - prev_ov_start)
                                 if valid > 0:
                                     prev_ov[:valid] = prev_audio[prev_ov_start:prev_ov_start+valid]
-                            # Get current audio head
-                            cur_ov = audio[:ov1 - ov0]
-                            if len(cur_ov) < ov1 - ov0:
-                                cur_ov = np.pad(cur_ov, (0, ov1 - ov0 - len(cur_ov)))
-                            # Create raised-cosine crossfade
-                            t = np.linspace(0, np.pi, ov1 - ov0, dtype=np.float32)
-                            fade_out = (np.cos(t) + 1) / 2  # 1 -> 0
-                            fade_in = (np.sin(t) + 1) / 2   # 0 -> 1
-                            # Mix overlap
-                            mixed_ov = prev_ov * fade_out + cur_ov * fade_in
-                            # Place mixed overlap into dialogue
-                            dialogue[ov0:ov1] += mixed_ov
+                            # Current audio head
+                            cur_ov_start = cf0 - i0
+                            cur_ov_end = cur_ov_start + (cf1 - cf0)
+                            cur_ov = audio[max(0, cur_ov_start):min(len(audio), cur_ov_end)]
+                            if len(cur_ov) < cf1 - cf0:
+                                cur_ov = np.pad(cur_ov, (0, cf1 - cf0 - len(cur_ov)))
+                            # Crossfade
+                            t = np.linspace(0, np.pi, cf1 - cf0, dtype=np.float32)
+                            fade_out = (np.cos(t) + 1) / 2
+                            fade_in = (np.sin(t) + 1) / 2
+                            mixed = prev_ov * fade_out + cur_ov * fade_in
+                            dialogue[cf0:cf1] += mixed
                             # Zero out the overlapping part in current audio to avoid double adding
-                            cur_audio = audio
-                            cur_audio[:len(cur_ov)] = 0.0
-                            audio = cur_audio
-            # Add current chunk (with overlap zeroed if any)
+                            audio_start_ov = max(0, cur_ov_start)
+                            audio_end_ov = min(len(audio), cur_ov_end)
+                            if audio_end_ov > audio_start_ov:
+                                audio[audio_start_ov:audio_end_ov] = 0.0
+                # If gap is larger, we place without crossfade (micro-fades handle it)
+            
+            # Place the current chunk (with overlap zeroed if any)
             end_idx = i0 + len(audio)
             if end_idx > n:
                 audio = audio[:n - i0]
                 end_idx = n
             if len(audio) > 0:
                 dialogue[i0:end_idx] += audio
+            
+            prev_chunk = (audio, start, end)
     else:
         dialogue = np.zeros(n, dtype=np.float32)
     
