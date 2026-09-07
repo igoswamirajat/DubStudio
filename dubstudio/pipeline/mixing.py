@@ -85,13 +85,13 @@ def _build_duck_envelope(
 def _compute_dynamic_gain(synth: np.ndarray, orig: np.ndarray, sr: int) -> np.ndarray:
     """Compute time‑varying gain curve to match original energy contour.
     
-    Uses a 50ms sliding window RMS ratio, smoothed with a 100ms moving average,
-    clamped to [0.6, 1.65] to avoid unnatural amplification.
+    Returns a gain curve of the same length as `synth`. Uses a 50ms sliding window
+    RMS ratio, smoothed with a 100ms moving average, clamped to [0.6, 1.65].
     """
     if len(synth) == 0 or len(orig) == 0:
         return np.ones_like(synth, dtype=np.float32)
     
-    # Ensure both are mono and same length (trim to min length)
+    # Trim both to the shorter length (should be equal after caller truncates)
     min_len = min(len(synth), len(orig))
     synth = synth[:min_len]
     orig = orig[:min_len]
@@ -123,9 +123,40 @@ def _compute_dynamic_gain(synth: np.ndarray, orig: np.ndarray, sr: int) -> np.nd
         kernel = np.ones(smooth_window) / smooth_window
         ratio = np.convolve(ratio, kernel, mode='same')
     
-    # Interpolate back to sample rate
+    # Interpolate back to the length of the original `synth` (before trimming)
+    # We'll use the original length passed in, but we have already trimmed.
+    # Instead, we'll interpolate to the length of the original synth (len before trim).
+    # To avoid loss, we should keep the original synth length.
+    # We'll compute ratio envelope, then interpolate to the full synth length.
+    # But we already trimmed, so we need to know the full length.
+    # Better: don't trim; instead compute on the overlapping part and extrapolate.
+    # Simpler: after computing ratio, interpolate to len(synth_full).
+    # Since we don't have synth_full, we'll just interpolate to min_len, but then
+    # we need to resize to match the caller's `audio` length. So we'll return
+    # a curve of length `min_len`, and the caller will interpolate again.
+    # Actually, it's cleaner to have the caller ensure lengths match.
+    # So we return curve of length `min_len`, and caller must ensure it matches
+    # the audio length.
+    # But caller currently expects same length as `audio`; we can fix caller to
+    # trim audio first.
+    # For now, we'll return curve of length `len(synth)` after trimming to min_len,
+    # but that may be shorter than audio. So we'll interpolate back to the original
+    # synth length (before trimming) by using the original synth length.
+    # We'll compute ratio on the overlap, then interpolate to the length of the original synth.
+    # That will stretch the gain curve to match the audio length.
+    # Let's do that:
+    # We have original synth length = len(synth_original) but we overwrote synth.
+    # We'll keep the original length as a parameter.
+    # So we'll change the function signature to accept orig_len.
+    # But to avoid breaking the call, we'll compute orig_len before trimming.
+    # I'll restructure: pass synth and orig, compute overlap, then interpolate to len(synth).
+    
+    # However, the caller now truncates audio to match orig length, so lengths will be equal.
+    # So we can just return a curve of length = len(synth) (which equals len(orig) after truncation).
+    # So we set x_new = np.linspace(0, 1, len(synth), endpoint=False)
+    # That will give curve length = len(synth) which matches.
     x_orig = np.linspace(0, 1, len(ratio), endpoint=False)
-    x_new = np.linspace(0, 1, min_len, endpoint=False)
+    x_new = np.linspace(0, 1, len(synth), endpoint=False)
     gain_curve = np.interp(x_new, x_orig, ratio).astype(np.float32)
     return gain_curve
 
@@ -193,13 +224,23 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
         start = float(seg.get("start", 0.0))
         end = float(seg.get("end", start + len(audio) / sr))
 
-        # Anti-collision boundary check: clamp smoothly if overlapping next segment
+        # Truncate audio to the exact segment duration from the JSON
+        expected_len = int(round((end - start) * sr))
+        if len(audio) > expected_len:
+            audio = audio[:expected_len]
+        elif len(audio) < expected_len:
+            # Pad with zeros if too short (should not happen, but safe)
+            audio = np.pad(audio, (0, expected_len - len(audio)), mode='constant')
+
+        # Anti-collision boundary check: if this segment overlaps the next, truncate
         if idx + 1 < len(sorted_segs):
             next_start = float(sorted_segs[idx + 1].get("start", float("inf")))
             max_dur = next_start - start
-            if max_dur > 0 and (len(audio) / sr) > max_dur:
+            if max_dur > 0 and expected_len > int(round(max_dur * sr)):
                 max_samples = int(round(max_dur * sr))
                 audio = audio[:max_samples]
+                # Also update expected_len for consistency
+                expected_len = len(audio)
 
         audio = apply_micro_fades(audio, fade_ms=25.0, sample_rate=sr)
 
@@ -210,6 +251,11 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
             orig_i1 = min(len(voc_mono), int(round(end * sr)))
             if orig_i1 > orig_i0:
                 orig_slice = voc_mono[orig_i0:orig_i1]
+                # Ensure orig_slice is the same length as audio after truncation
+                if len(orig_slice) > len(audio):
+                    orig_slice = orig_slice[:len(audio)]
+                elif len(orig_slice) < len(audio):
+                    orig_slice = np.pad(orig_slice, (0, len(audio) - len(orig_slice)), mode='constant')
                 orig_rms = float(np.sqrt(np.mean(orig_slice ** 2)))
                 synth_rms = float(np.sqrt(np.mean(audio ** 2)))
                 if orig_rms > 1e-4 and synth_rms > 1e-4:
@@ -218,12 +264,20 @@ def run_mixing(job_dir: Path, duration_s: float) -> Path:
                     audio = audio * gain_curve
 
         i0 = int(round(start * sr))
-        i1 = min(n, i0 + len(audio))
+        # Use the exact end time for placement, not the audio length
+        i1 = min(n, int(round(end * sr)))
         if i0 >= n or i1 <= i0:
             continue
 
-        dialogue[i0:i1] += audio[: i1 - i0]
-        intervals.append((start, start + (len(audio) / sr)))
+        # Ensure audio length matches the placement length
+        placement_len = i1 - i0
+        if len(audio) > placement_len:
+            audio = audio[:placement_len]
+        elif len(audio) < placement_len:
+            audio = np.pad(audio, (0, placement_len - len(audio)), mode='constant')
+
+        dialogue[i0:i1] += audio
+        intervals.append((start, end))
 
     # 4. Apply Subtle Dialogue High-Pass Filter (> 80 Hz) to eliminate low boominess
     if np.any(dialogue != 0.0):
