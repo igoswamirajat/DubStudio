@@ -259,6 +259,41 @@ def _room_tone(n: int, sr: int, level: float, seed: int = 20240914) -> np.ndarra
     return (tone * (level / rms)).astype(np.float32)
 
 
+def _render_units(segments: list[dict]) -> list[dict]:
+    """Collapse each speech block into ONE render unit.
+
+    A block is synthesised in a single call and fitted with a single tempo
+    ratio, so it has to be laid down as one continuous piece. Mixing it cue by
+    cue would clamp it to the first cue's slot and re-create exactly the edit
+    points the block exists to remove. A cue with no block stays its own unit.
+    """
+    units: list[dict] = []
+    for seg in segments:
+        sid = seg.get("segment_id")
+        start = float(seg.get("start", 0.0) or 0.0)
+        end = float(seg.get("end", 0.0) or 0.0)
+        wav = seg.get("fitted_wav") or seg.get("generated_wav")
+        block_id = seg.get("block_id")
+        if block_id and units and units[-1]["block_id"] == block_id:
+            unit = units[-1]
+            unit["segment_ids"].append(sid)
+            unit["start"] = min(unit["start"], start)
+            unit["end"] = max(unit["end"], end)
+            if not unit["wav"]:
+                unit["wav"] = wav
+            continue
+        units.append({
+            "id": block_id or sid,
+            "label": f"Block {block_id}" if block_id else f"Segment {sid}",
+            "block_id": block_id,
+            "segment_ids": [sid],
+            "start": start,
+            "end": end,
+            "wav": wav,
+        })
+    return units
+
+
 def run_mixing(
     job_dir: Path,
     duration_s: float,
@@ -321,42 +356,40 @@ def run_mixing(
         for s in sorted_segs
         if float(s.get("end", 0.0)) > float(s.get("start", 0.0))
     ]
+    units = _render_units(sorted_segs)
     failed_segments = [
-        s.get("segment_id")
-        for s in sorted_segs
-        if not (s.get("fitted_wav") or s.get("generated_wav"))
+        sid for unit in units if not unit["wav"] for sid in unit["segment_ids"]
     ]
 
-    # 3. Build the dialogue chunks
+    # 3. Build the dialogue chunks - one per render unit (a block, or a lone cue)
     chunks: list[tuple[np.ndarray, float, float]] = []
-    for idx, seg in enumerate(sorted_segs):
-        wav_rel = seg.get("fitted_wav") or seg.get("generated_wav")
+    for idx, unit in enumerate(units):
+        wav_rel = unit["wav"]
         if not wav_rel:
             continue
         wav_path = job_dir / wav_rel
         if not wav_path.exists():
-            log.warning("Missing audio for segment %s at %s", seg.get("segment_id"), wav_path)
-            if seg.get("segment_id") not in failed_segments:
-                failed_segments.append(seg.get("segment_id"))
+            log.warning("Missing audio for %s at %s", unit["label"], wav_path)
+            failed_segments.extend(s for s in unit["segment_ids"] if s not in failed_segments)
             continue
 
         audio, _ = read_mono(wav_path, target_sr=sr)
         if audio.size == 0:
             continue
-        start = float(seg.get("start", 0.0))
-        end = float(seg.get("end", start + len(audio) / sr))
+        start = float(unit["start"])
+        end = max(float(unit["end"]), start + len(audio) / sr)
 
         # A line may run past its ASR end rather than be cut mid-word, but it
-        # must never run into the next line.
-        next_start = float(sorted_segs[idx + 1].get("start", float("inf"))) if idx + 1 < len(sorted_segs) else float("inf")
+        # must never run into the next unit.
+        next_start = float(units[idx + 1]["start"]) if idx + 1 < len(units) else float("inf")
         room_s = max(0.0, min(next_start - start, n / sr - start))
         max_samples = int(round(room_s * sr))
         if max_samples <= 0:
             continue
         if len(audio) > max_samples:
             log.warning(
-                "Segment %s overruns the next line by %d ms; trimming",
-                seg.get("segment_id"),
+                "%s overruns the next line by %d ms; trimming",
+                unit["label"],
                 int((len(audio) - max_samples) / sr * 1000),
             )
             audio = audio[:max_samples]
