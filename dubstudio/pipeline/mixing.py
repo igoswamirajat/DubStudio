@@ -11,13 +11,71 @@ from dubstudio.util.audio import apply_micro_fades, read_audio, read_mono, write
 log = logging.getLogger("dubstudio.mixing")
 
 # --- mix tuning -------------------------------------------------------------
-DUCK_GAIN = 0.32            # -10 dB pocket under dialogue (was 0.78 = -2.2 dB)
+DUCK_GAIN = 0.32            # -10 dB pocket under dialogue
 DIALOGUE_TARGET_RMS = 0.09  # ~-21 dBFS RMS over speech regions
 RESIDUAL_LEVEL = 0.60       # level of preserved original non-speech audio
 SPEECH_GUARD_PAD_S = 0.25   # guard band around every SOURCE speech window
-CROSSFADE_S = 0.040
-BRIDGE_GAP_S = 0.080
-GAIN_CLAMP = (0.72, 1.40)   # +-3 dB of emotion tracking (was 0.6 / 1.65)
+CROSSFADE_S = 0.040         # legacy name, kept for API compatibility
+GAIN_CLAMP = (0.72, 1.40)   # +-3 dB of emotion tracking
+
+# --- continuity (the "every line starts from digital silence" fix) ----------
+# A dub used to be pasted at its ASR timestamp into an all-zero bus, so between
+# two lines the dialogue did not pause, it *disappeared*: onset steps of 25-44
+# dB, and the bed released to full gain inside every gap (+18 dB swells).
+JOIN_CROSSFADE_S = 0.030    # real overlapping equal-power crossfade at joins
+BRIDGE_GAP_S = 0.30         # joins shorter than this are welded (was 0.080)
+MAX_LEAD_S = 0.20           # a line may never be pulled more than this early
+DUCK_HOLD_GAP_S = 0.70      # bed stays ducked across pauses shorter than this
+CHUNK_FADE_MS = 5.0         # click protection only (was 20 ms -> audible dips)
+ROOM_TONE_RATIO = 0.04      # room tone RMS relative to DIALOGUE_TARGET_RMS
+ROOM_TONE_EDGE_S = 0.015
+MIN_HOLE_S = 0.35           # an uncovered speech window this long is reported
+MIN_COVERAGE = 0.95         # below this the mix is flagged "degraded"
+
+
+# --- interval helpers -------------------------------------------------------
+def _merge(intervals, bridge_gap_s: float = 0.0) -> list[tuple[float, float]]:
+    """Sort + merge intervals, welding neighbours closer than bridge_gap_s."""
+    merged: list[list[float]] = []
+    for start, end in sorted((float(a), float(b)) for a, b in intervals):
+        if end <= start:
+            continue
+        if merged and start - merged[-1][1] <= bridge_gap_s:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(a, b) for a, b in merged]
+
+
+def _total(intervals) -> float:
+    return float(sum(b - a for a, b in intervals))
+
+
+def _intersect(a_list, b_list) -> list[tuple[float, float]]:
+    out = []
+    for a, b in a_list:
+        for c, d in b_list:
+            lo, hi = max(a, c), min(b, d)
+            if hi > lo:
+                out.append((lo, hi))
+    return _merge(out)
+
+
+def _gaps_inside(runs, covered) -> list[tuple[float, float]]:
+    """Stretches inside `runs` that `covered` does not reach."""
+    holes = []
+    for a, b in runs:
+        cursor = a
+        for c, d in covered:
+            if d <= a or c >= b:
+                continue
+            c, d = max(c, a), min(d, b)
+            if c > cursor:
+                holes.append((cursor, c))
+            cursor = max(cursor, d)
+        if cursor < b:
+            holes.append((cursor, b))
+    return holes
 
 
 def _build_duck_envelope(
@@ -35,14 +93,7 @@ def _build_duck_envelope(
     if not intervals:
         return envelope
 
-    merged: list[list[float]] = []
-    for start, end in sorted(intervals, key=lambda x: x[0]):
-        if end <= start:
-            continue
-        if merged and start - merged[-1][1] <= bridge_gap_s:
-            merged[-1][1] = max(merged[-1][1], end)
-        else:
-            merged.append([start, end])
+    merged = _merge(intervals, bridge_gap_s)
 
     att_samples = int(round(attack_s * sr))
     hold_samples = int(round(hold_s * sr))
@@ -156,6 +207,58 @@ def _speech_mask(
     return mask
 
 
+def _highpass(x: np.ndarray, sr: int, cutoff: float = 80.0) -> np.ndarray:
+    """80 Hz high-pass. Falls back to a moving-average subtraction when scipy
+    is missing, so the filter is never a silent no-op."""
+    if x.size == 0:
+        return x
+    try:
+        from scipy.signal import butter, lfilter
+
+        b, a = butter(2, cutoff / (sr / 2), btype="highpass")
+        return lfilter(b, a, x).astype(np.float32)
+    except Exception:
+        log.debug("scipy unavailable; using moving-average high-pass")
+
+    win = max(3, int(round(sr / max(cutoff, 1.0))))
+    if x.size < win * 2:
+        return x
+    pad_l = win // 2
+    xp = np.pad(x.astype(np.float64), (pad_l, win - pad_l), mode="edge")
+    cum = np.concatenate(([0.0], np.cumsum(xp)))
+    moving = (cum[win:win + x.size] - cum[:x.size]) / win
+    return (x - moving).astype(np.float32)
+
+
+def _noise_floor(chunks, sr: int) -> float:
+    """10th-percentile 20 ms RMS across the rendered dialogue = its own floor."""
+    win = max(1, int(0.020 * sr))
+    vals = []
+    for audio, _s, _e in chunks:
+        if audio.size < win:
+            continue
+        frames = audio.size // win
+        block = audio[:frames * win].reshape(frames, win)
+        vals.append(np.sqrt((block ** 2).mean(axis=1)))
+    if not vals:
+        return 0.0
+    return float(np.percentile(np.concatenate(vals), 10))
+
+
+def _room_tone(n: int, sr: int, level: float, seed: int = 20240914) -> np.ndarray:
+    """Low-level, softly low-passed presence noise. Deterministic for tests."""
+    if n <= 0 or level <= 0.0:
+        return np.zeros(max(0, n), dtype=np.float32)
+    rng = np.random.default_rng(seed)
+    noise = rng.standard_normal(n + 16).astype(np.float32)
+    kernel = np.ones(8, dtype=np.float32) / 8.0
+    tone = np.convolve(noise, kernel, mode="same")[:n]
+    rms = float(np.sqrt(np.mean(tone ** 2)))
+    if rms <= 1e-9:
+        return np.zeros(n, dtype=np.float32)
+    return (tone * (level / rms)).astype(np.float32)
+
+
 def run_mixing(
     job_dir: Path,
     duration_s: float,
@@ -168,9 +271,17 @@ def run_mixing(
 
     Guarantees:
       * the original speaker is never re-injected inside a source speech window
-        (mid-line pauses, soft lines and failed segments included);
-      * a failed segment leaves a clean hole and is reported in mix/qc.json
-        instead of being papered over with the source audio.
+        (mid-line pauses, soft lines and failed segments included) unless
+        restore_original_on_failure is explicitly turned on;
+      * consecutive lines are welded with a real overlapping crossfade instead
+        of being pasted into silence, and the dialogue bus keeps a room-tone
+        floor for the whole length of a talking run, so a pause sounds like a
+        breath rather than like the audio dropping out;
+      * the bed stays ducked across pauses shorter than DUCK_HOLD_GAP_S and
+        across uncovered speech windows, so it can no longer swell inside a
+        hole and then re-duck;
+      * coverage is measured and reported in mix/qc.json, so a job that lost
+        speech is marked "degraded" instead of shipping silently.
     """
     path = job_dir / "segments" / "segments.json"
     segments = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
@@ -204,7 +315,7 @@ def run_mixing(
     sorted_segs = sorted(segments, key=lambda s: float(s.get("start", 0.0)))
 
     # Every ASR speech window, INCLUDING the ones whose TTS failed. This is the
-    # guard region for original-audio restoration.
+    # guard region for original-audio restoration and the ducking reference.
     source_speech = [
         (float(s.get("start", 0.0)), float(s.get("end", 0.0)))
         for s in sorted_segs
@@ -262,29 +373,48 @@ def run_mixing(
                 if float(np.sqrt(np.mean(ref ** 2))) > 1e-4 and float(np.sqrt(np.mean(audio ** 2))) > 1e-4:
                     audio = audio * _compute_dynamic_gain(audio, ref, sr)
 
-        audio = apply_micro_fades(audio, fade_ms=20.0, sample_rate=sr)
+        # Click protection only. A 20 ms fade per line is what made every
+        # utterance dip to zero at both ends.
+        audio = apply_micro_fades(audio, fade_ms=CHUNK_FADE_MS, sample_rate=sr)
         chunks.append((audio.astype(np.float32), start, start + len(audio) / sr))
 
-    # 4. Render with equal-power crossfades at tight joins
+    # 4. Assemble the dialogue bus with real overlapping crossfades.
+    #    A short gap is closed by pulling the incoming line back onto the tail
+    #    of the outgoing one (bounded by MAX_LEAD_S against its own timestamp,
+    #    so the shift can never accumulate across a run).
     dialogue = np.zeros(n, dtype=np.float32)
     intervals: list[tuple[float, float]] = []
-    prev_end: float | None = None
+    xfade = max(2, int(round(JOIN_CROSSFADE_S * sr)))
+    lead_cap = int(round(MAX_LEAD_S * sr))
+    joins_welded = 0
+    join_gaps_ms: list[int] = []
+    prev_end_i: int | None = None
+
     for audio, start, _end in chunks:
-        i0 = int(round(start * sr))
+        desired_i = int(round(start * sr))
+        i0 = desired_i
+        if prev_end_i is not None:
+            gap_s = (desired_i - prev_end_i) / sr
+            join_gaps_ms.append(int(round(gap_s * 1000)))
+            if gap_s < BRIDGE_GAP_S:
+                i0 = max(0, desired_i - lead_cap, min(desired_i, prev_end_i) - xfade)
+                joins_welded += 1
         if i0 >= n:
             continue
         piece = audio[:max(0, n - i0)]
         if piece.size == 0:
             continue
-        if prev_end is not None and 0.0 <= start - prev_end < BRIDGE_GAP_S:
-            cf = min(int(round(CROSSFADE_S * sr)), piece.size)
-            if cf > 1:
-                piece = piece.copy()
-                t = np.linspace(0.0, np.pi / 2, cf, dtype=np.float32)
-                piece[:cf] *= np.sin(t) ** 2
+
+        overlap = 0 if prev_end_i is None else max(0, min(prev_end_i - i0, piece.size))
+        if overlap > 1:
+            t = np.linspace(0.0, np.pi / 2, overlap, dtype=np.float32)
+            dialogue[i0:i0 + overlap] *= np.cos(t)   # fade the outgoing line out
+            piece = piece.copy()
+            piece[:overlap] *= np.sin(t)             # ... and the incoming one in
+
         dialogue[i0:i0 + piece.size] += piece
-        intervals.append((start, start + piece.size / sr))
-        prev_end = intervals[-1][1]
+        intervals.append((i0 / sr, (i0 + piece.size) / sr))
+        prev_end_i = i0 + piece.size
 
     # 5. Normalise dialogue loudness across speech regions only
     if intervals:
@@ -294,29 +424,61 @@ def run_mixing(
             if int(b * sr) > int(a * sr)
         ]
         if idx_parts:
-            speech_idx = np.concatenate(idx_parts)
+            speech_idx = np.unique(np.concatenate(idx_parts))
             current = float(np.sqrt(np.mean(dialogue[speech_idx] ** 2)))
             if current > 1e-5:
                 dialogue = dialogue * float(np.clip(DIALOGUE_TARGET_RMS / current, 0.25, 4.0))
 
     # 6. Gentle high-pass to remove low boominess
     if np.any(dialogue != 0.0):
-        try:
-            from scipy.signal import butter, lfilter
+        dialogue = _highpass(dialogue, sr, 80.0)
 
-            b, a = butter(2, 80.0 / (sr / 2), btype="highpass")
-            dialogue = lfilter(b, a, dialogue).astype(np.float32)
-        except Exception:
-            log.debug("scipy unavailable; skipping dialogue high-pass")
+    # 7. Coverage analysis: which source speech did the dub actually replace?
+    src_windows = _merge(source_speech)
+    source_runs = _merge(source_speech, DUCK_HOLD_GAP_S)
+    covered = _merge(intervals)
+    speech_total = _total(src_windows)
+    covered_total = _total(_intersect(src_windows, covered))
+    coverage = 1.0 if speech_total <= 0.0 else covered_total / speech_total
+    report_holes = [(a, b) for a, b in _gaps_inside(src_windows, covered) if b - a >= MIN_HOLE_S]
+    holes_over_1s = sum(1 for a, b in report_holes if b - a >= 1.0)
+    largest_hole = max((b - a for a, b in report_holes), default=0.0)
 
-    # 7. Duck the bed under the dub
-    duck = _build_duck_envelope(intervals, n, sr=sr, duck_gain=duck_gain, attack_s=0.18,
-                                hold_s=0.10, release_s=0.40, bridge_gap_s=0.35)
+    # 8. Room tone: inside a talking run the dialogue bus must never sit at
+    #    digital zero, otherwise every line starts from -inf dB and each pause
+    #    sounds like the track dropped out.
+    room_level = 0.0
+    fill_gaps = [(a, b) for a, b in _gaps_inside(source_runs, covered) if b - a > 0.005]
+    if chunks and fill_gaps:
+        cap = DIALOGUE_TARGET_RMS * ROOM_TONE_RATIO
+        floor = _noise_floor(chunks, sr)
+        room_level = float(min(floor, cap)) if floor > cap * 0.1 else cap
+        tone = _room_tone(n, sr, room_level)
+        edge = max(1, int(round(ROOM_TONE_EDGE_S * sr)))
+        for a, b in fill_gaps:
+            i0, i1 = max(0, int(round(a * sr))), min(n, int(round(b * sr)))
+            if i1 - i0 <= 2:
+                continue
+            piece = tone[i0:i1].copy()
+            e = min(edge, (i1 - i0) // 2)
+            if e > 1:
+                t = np.linspace(0.0, np.pi / 2, e, dtype=np.float32)
+                piece[:e] *= np.sin(t) ** 2
+                piece[-e:] *= np.cos(t) ** 2
+            dialogue[i0:i1] += piece
 
-    # 8. Restore original NON-SPEECH audio only (laughter, chimes, reactions).
-    #    Gated by the SOURCE speech windows, never by the dub's amplitude, so a
-    #    quiet or missing dub can no longer bring the original speaker back.
-    guard = intervals if restore_original_on_failure else source_speech
+    # 9. Duck the bed under the WHOLE talking run, not just the rendered bits.
+    #    Building this from the rendered chunks is what let the bed release to
+    #    full gain inside a hole and then duck again (+18 dB swell).
+    duck = _build_duck_envelope(
+        list(src_windows) + list(covered), n, sr=sr, duck_gain=duck_gain,
+        attack_s=0.18, hold_s=0.12, release_s=0.40, bridge_gap_s=DUCK_HOLD_GAP_S,
+    )
+
+    # 10. Restore original NON-SPEECH audio only (laughter, chimes, reactions).
+    #     Gated by the SOURCE speech windows, never by the dub's amplitude, so a
+    #     quiet or missing dub can no longer bring the original speaker back.
+    guard = list(covered) if restore_original_on_failure else list(src_windows)
     residual_gate = 1.0 - _speech_mask(guard, n, sr)
     residual = np.zeros_like(bed)
     if voc is not None:
@@ -330,20 +492,21 @@ def run_mixing(
         else:
             residual = (voc_stereo[:n].mean(axis=-1) * residual_gate[:n] * residual_level).astype(np.float32)
 
-    # 9. Composite
+    # 11. Composite
     if is_stereo:
         mix = bed * duck[:, None] + np.column_stack([dialogue, dialogue]) + residual
     else:
         mix = (bed.squeeze() if bed.ndim > 1 else bed) * duck + dialogue + residual
     mix = _soft_limit(mix)
 
-    # 10. Artifacts + QC report
+    # 12. Artifacts + QC report
     mix_dir = job_dir / "mix"
     mix_dir.mkdir(parents=True, exist_ok=True)
     write_wav(mix_dir / "dialogue.wav", dialogue, sr)
     final_path = mix_dir / "final.wav"
     write_wav(final_path, mix, sr)
 
+    degraded = bool(failed_segments) or coverage < MIN_COVERAGE or holes_over_1s > 0
     qc = {
         "segments_total": len(sorted_segs),
         "segments_mixed": len(chunks),
@@ -353,8 +516,27 @@ def run_mixing(
         "residual_level": residual_level,
         "dialogue_peak": round(float(np.max(np.abs(dialogue))) if dialogue.size else 0.0, 4),
         "mix_peak": round(float(np.max(np.abs(mix))) if mix.size else 0.0, 4),
+        # continuity / coverage
+        "status": "degraded" if degraded else "ok",
+        "coverage": round(float(coverage), 4),
+        "source_speech_s": round(speech_total, 2),
+        "covered_speech_s": round(covered_total, 2),
+        "uncovered_speech_s": round(max(0.0, speech_total - covered_total), 2),
+        "holes": [[round(a, 2), round(b, 2)] for a, b in report_holes],
+        "largest_hole_s": round(float(largest_hole), 2),
+        "holes_over_1s": holes_over_1s,
+        "joins_welded": joins_welded,
+        "max_join_gap_ms": max(join_gaps_ms) if join_gaps_ms else 0,
+        "room_tone_rms": round(room_level, 5),
+        "original_restored": bool(restore_original_on_failure),
     }
     (mix_dir / "qc.json").write_text(json.dumps(qc, indent=2), encoding="utf-8")
     if failed_segments:
         log.error("Mixed with %d failed segment(s): %s", len(failed_segments), failed_segments)
+    if coverage < MIN_COVERAGE:
+        log.error(
+            "Only %.1f%% of the source speech was dubbed; %.2f s left uncovered "
+            "(largest hole %.2f s). Mix marked degraded.",
+            coverage * 100.0, speech_total - covered_total, largest_hole,
+        )
     return final_path
