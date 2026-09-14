@@ -7,9 +7,6 @@ from pathlib import Path
 
 from dubstudio.util.audio import duration_ms
 
-# A translated line is rarely the same length as the source. +-12% was far too
-# tight, so overlong lines were handed to the mixer and cut mid-word. Give the
-# stretcher a real budget; atempo stays transparent well past this range.
 DEFAULT_MAX_STRETCH = 0.25
 
 
@@ -37,22 +34,20 @@ def fit_segment(src: Path, dest: Path, target_ms: int, *, max_stretch: float = D
     work_src = src
     temp_trimmed = None
 
-    # If audio is longer than target, trim leading & trailing silence before applying any stretching
     if gen_ms > target_ms * 1.05:
         try:
             import numpy as np
             from dubstudio.util.audio import read_audio, write_wav
 
             data, sr = read_audio(src, target_sr=48000, mono=True)
-            thresh = 10 ** (-42.0 / 20.0)  # -42 dB noise gate
+            thresh = 10 ** (-42.0 / 20.0)
             non_silent = np.where(np.abs(data) > thresh)[0]
             if len(non_silent) > 0:
-                pad = int(sr * 0.05)  # 50ms padding
+                pad = int(sr * 0.05)
                 start = max(0, non_silent[0] - pad)
                 end = min(len(data), non_silent[-1] + pad)
                 trimmed = data[start:end]
                 trimmed_ms = int(round(len(trimmed) / sr * 1000))
-                # Only use trimmed version if it trimmed dead air without cutting the line
                 if trimmed_ms >= target_ms * 0.9 and trimmed_ms < gen_ms:
                     temp_trimmed = dest.parent / f"{dest.stem}.trimmed.wav"
                     temp_trimmed.parent.mkdir(parents=True, exist_ok=True)
@@ -65,7 +60,6 @@ def fit_segment(src: Path, dest: Path, target_ms: int, *, max_stretch: float = D
     ratio = gen_ms / target_ms
     lo, hi = 1.0 - max_stretch, 1.0 + max_stretch
 
-    # If within 5%, leave natural rhythm untouched (no pitch/tempo artifacts)
     if 0.95 <= ratio <= 1.05:
         shutil.copy2(work_src, dest)
         if temp_trimmed and temp_trimmed.exists():
@@ -93,8 +87,6 @@ def fit_segment(src: Path, dest: Path, target_ms: int, *, max_stretch: float = D
     except Exception:
         pass
 
-    # What could not be absorbed by stretching. The mixer lets a line run into
-    # the following silence instead of cutting a word, and QC reports it.
     overflow_ms = max(0, fitted - target_ms)
     status = "ok" if abs(1 - applied) <= 0.01 else "needs_stretch"
     if overflow_ms > 250:
@@ -104,6 +96,17 @@ def fit_segment(src: Path, dest: Path, target_ms: int, *, max_stretch: float = D
 
 
 def run_timing(job_dir: Path, job: dict | None = None, *, max_stretch: float = DEFAULT_MAX_STRETCH) -> list[dict]:
+    from dubstudio.pipeline.blocks import load_blocks
+
+    if load_blocks(job_dir):
+        # This job was synthesised as whole blocks, so it has to be fitted as
+        # whole blocks: one tempo ratio per run of speech instead of one per
+        # cue, which is what used to make the speaking rate jump mid-sentence.
+        from dubstudio.pipeline.align import run_align
+
+        run_align(job_dir, job)
+        return json.loads((job_dir / "segments" / "segments.json").read_text(encoding="utf-8"))
+
     path = job_dir / "segments" / "segments.json"
     segments = json.loads(path.read_text(encoding="utf-8"))
     timing_dir = job_dir / "timing"
