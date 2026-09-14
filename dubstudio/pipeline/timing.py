@@ -7,6 +7,11 @@ from pathlib import Path
 
 from dubstudio.util.audio import duration_ms
 
+# A translated line is rarely the same length as the source. +-12% was far too
+# tight, so overlong lines were handed to the mixer and cut mid-word. Give the
+# stretcher a real budget; atempo stays transparent well past this range.
+DEFAULT_MAX_STRETCH = 0.25
+
 
 def _atempo_chain(ratio: float) -> list[str]:
     factors: list[float] = []
@@ -22,7 +27,7 @@ def _atempo_chain(ratio: float) -> list[str]:
     return factors
 
 
-def fit_segment(src: Path, dest: Path, target_ms: int, *, max_stretch: float = 0.12) -> dict:
+def fit_segment(src: Path, dest: Path, target_ms: int, *, max_stretch: float = DEFAULT_MAX_STRETCH) -> dict:
     gen_ms = duration_ms(src)
     if gen_ms <= 0:
         shutil.copy2(src, dest)
@@ -65,7 +70,8 @@ def fit_segment(src: Path, dest: Path, target_ms: int, *, max_stretch: float = 0
         shutil.copy2(work_src, dest)
         if temp_trimmed and temp_trimmed.exists():
             temp_trimmed.unlink(missing_ok=True)
-        return {"stretch_ratio": 1.0, "generated_duration_ms": gen_ms, "fitted_duration_ms": gen_ms, "status": "ok"}
+        return {"stretch_ratio": 1.0, "generated_duration_ms": gen_ms, "fitted_duration_ms": gen_ms,
+                "overflow_ms": 0, "status": "ok"}
 
     applied = max(lo, min(hi, ratio))
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -86,15 +92,24 @@ def fit_segment(src: Path, dest: Path, target_ms: int, *, max_stretch: float = 0
         fitted = duration_ms(dest)
     except Exception:
         pass
-    return {"stretch_ratio": applied, "generated_duration_ms": gen_ms, "fitted_duration_ms": fitted, "status": "needs_stretch" if abs(1 - applied) > 0.01 else "ok"}
+
+    # What could not be absorbed by stretching. The mixer lets a line run into
+    # the following silence instead of cutting a word, and QC reports it.
+    overflow_ms = max(0, fitted - target_ms)
+    status = "ok" if abs(1 - applied) <= 0.01 else "needs_stretch"
+    if overflow_ms > 250:
+        status = "overflow"
+    return {"stretch_ratio": applied, "generated_duration_ms": gen_ms, "fitted_duration_ms": fitted,
+            "overflow_ms": overflow_ms, "status": status}
 
 
-def run_timing(job_dir: Path, job: dict | None = None) -> list[dict]:
+def run_timing(job_dir: Path, job: dict | None = None, *, max_stretch: float = DEFAULT_MAX_STRETCH) -> list[dict]:
     path = job_dir / "segments" / "segments.json"
     segments = json.loads(path.read_text(encoding="utf-8"))
     timing_dir = job_dir / "timing"
     timing_dir.mkdir(parents=True, exist_ok=True)
     total = len(segments)
+    overflows: list[str] = []
     for i, seg in enumerate(segments):
         if job and job.get("job_id") and total > 0:
             try:
@@ -111,12 +126,17 @@ def run_timing(job_dir: Path, job: dict | None = None) -> list[dict]:
             continue
         src = job_dir / gen_rel
         out = timing_dir / f"{seg['segment_id']}.fitted.wav"
-        info = fit_segment(src, out, int(seg.get("target_duration_ms") or 1000))
+        info = fit_segment(src, out, int(seg.get("target_duration_ms") or 1000), max_stretch=max_stretch)
         seg["fitted_wav"] = str(out.relative_to(job_dir))
         seg["generated_duration_ms"] = info["generated_duration_ms"]
         seg["fitted_duration_ms"] = info["fitted_duration_ms"]
         seg["stretch_ratio"] = info["stretch_ratio"]
+        seg["overflow_ms"] = info.get("overflow_ms", 0)
         seg["status"] = "ok"
+        if info.get("status") == "overflow":
+            overflows.append(seg["segment_id"])
         (timing_dir / f"{seg['segment_id']}.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
+    if overflows and job is not None:
+        job["timing_overflows"] = overflows
     path.write_text(json.dumps(segments, indent=2, ensure_ascii=False), encoding="utf-8")
     return segments
