@@ -23,12 +23,21 @@ class Settings(BaseSettings):
     whisper_model: str = "large-v3"
     whisper_device: str = "auto"  # auto | cuda | cpu
     whisper_compute_type: str = "auto"  # auto | float16 | int8_float16 | int8
+    # Escape hatch: when ASR fails, fall back to the built-in demo transcript
+    # instead of failing the job. Off by default - a demo transcript silently
+    # replacing a real video is how a dub ends up saying the wrong words.
+    allow_mock_fallback: bool = False
 
     # --- TTS ---
     tts_engine: str = "omnivoice"  # omnivoice | chatterbox | dummy
 
     # --- Translation ---
     translator: str = "ollama"  # ollama | openai | demo
+    # Fail the job instead of shipping lines that are still in the source
+    # language. Turn off only to inspect a partial run.
+    strict_translation: bool = True
+    # Attempts per segment; retries use a stricter prompt.
+    translation_attempts: int = 2
     ollama_host: str = Field(
         default="http://127.0.0.1:11434",
         validation_alias=AliasChoices("DUBSTUDIO_OLLAMA_HOST", "OLLAMA_HOST"),

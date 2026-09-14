@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import difflib
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any
@@ -9,22 +11,46 @@ import httpx
 
 from dubstudio.settings import settings
 
+log = logging.getLogger("dubstudio.translation")
+
+# A translated line must be at least this fraction of target-script letters,
+# otherwise the model echoed the source instead of translating it.
+MIN_TARGET_SCRIPT_RATIO = 0.30
+# Latin-script targets have no script signal, so fall back to text similarity.
+MAX_SOURCE_SIMILARITY = 0.90
+
+
+class TranslationError(RuntimeError):
+    """Raised when the configured translator cannot produce usable output.
+
+    Shipping an un-translated dub is worse than failing: the viewer gets the
+    original language back with a synthetic voice on top. Fail loudly instead.
+    """
+
+
+# --------------------------------------------------------------------------
+# Demo-only word map. This is NOT a production fallback: it is reachable only
+# when settings.translator == "demo". Historically it ran silently whenever the
+# LLM was unreachable, which produced output like
+#   "So today I am going में show you how में scrape any website के लिए free"
+# i.e. three words translated and the rest left in the source language.
+# --------------------------------------------------------------------------
 _DEMO_HI = {
-    "hello": "\u0928\u092e\u0938\u094d\u0924\u0947", "and": "\u0914\u0930", "welcome": "\u0938\u094d\u0935\u093e\u0917\u0924 \u0939\u0948",
-    "to": "\u092e\u0947\u0902", "dubstudio": "\u0921\u092c\u0938\u094d\u091f\u0942\u0921\u093f\u092f\u094b", "this": "\u092f\u0939", "is": "\u0939\u0948",
-    "a": "\u090f\u0915", "short": "\u091b\u094b\u091f\u093e", "demo": "\u0921\u0947\u092e\u094b", "clip": "\u0915\u094d\u0932\u093f\u092a",
-    "for": "\u0915\u0947 \u0932\u093f\u090f", "testing": "\u092a\u0930\u0940\u0915\u094d\u0937\u0923", "we": "\u0939\u092e", "will": "\u0915\u0930\u0947\u0902\u0917\u0947",
-    "translate": "\u0905\u0928\u0941\u0935\u093e\u0926", "dub": "\u0921\u092c", "speech": "\u092d\u093e\u0937\u0923",
+    "hello": "नमस्ते", "and": "और", "welcome": "स्वागत है",
+    "to": "में", "dubstudio": "डबस्टूडियो", "this": "यह", "is": "है",
+    "a": "एक", "short": "छोटा", "demo": "डेमो", "clip": "क्लिप",
+    "for": "के लिए", "testing": "परीक्षण", "we": "हम", "will": "करेंगे",
+    "translate": "अनुवाद", "dub": "डब", "speech": "भाषण",
 }
 
 
 def _simple_map(text: str, target: str) -> str:
+    """Demo-mode only. See _DEMO_HI."""
     if target not in {"hi", "hin"}:
         return f"[{target}] {text}"
     out = []
     for tok in re.findall(r"\w+|[^\w\s]", text, flags=re.UNICODE):
-        key = tok.lower()
-        out.append(_DEMO_HI.get(key, tok))
+        out.append(_DEMO_HI.get(tok.lower(), tok))
     return " ".join(out)
 
 
@@ -38,25 +64,105 @@ _LANG_NAMES = {
     "id": "Indonesian", "vi": "Vietnamese", "th": "Thai",
 }
 
+# Expected writing system per target language, used to verify the model really
+# switched languages instead of returning the source line.
+_TARGET_SCRIPTS: dict[str, tuple[str, tuple[tuple[int, int], ...]]] = {
+    "hi": ("Devanagari", ((0x0900, 0x097F),)),
+    "mr": ("Devanagari", ((0x0900, 0x097F),)),
+    "ne": ("Devanagari", ((0x0900, 0x097F),)),
+    "bn": ("Bengali", ((0x0980, 0x09FF),)),
+    "gu": ("Gujarati", ((0x0A80, 0x0AFF),)),
+    "pa": ("Gurmukhi", ((0x0A00, 0x0A7F),)),
+    "ta": ("Tamil", ((0x0B80, 0x0BFF),)),
+    "te": ("Telugu", ((0x0C00, 0x0C7F),)),
+    "kn": ("Kannada", ((0x0C80, 0x0CFF),)),
+    "ml": ("Malayalam", ((0x0D00, 0x0D7F),)),
+    "or": ("Odia", ((0x0B00, 0x0B7F),)),
+    "ur": ("Arabic", ((0x0600, 0x06FF),)),
+    "ar": ("Arabic", ((0x0600, 0x06FF),)),
+    "fa": ("Arabic", ((0x0600, 0x06FF),)),
+    "he": ("Hebrew", ((0x0590, 0x05FF),)),
+    "ru": ("Cyrillic", ((0x0400, 0x04FF),)),
+    "uk": ("Cyrillic", ((0x0400, 0x04FF),)),
+    "el": ("Greek", ((0x0370, 0x03FF),)),
+    "th": ("Thai", ((0x0E00, 0x0E7F),)),
+    "ko": ("Hangul", ((0xAC00, 0xD7AF), (0x1100, 0x11FF))),
+    "ja": ("Japanese", ((0x3040, 0x30FF), (0x4E00, 0x9FFF))),
+    "zh": ("Chinese", ((0x4E00, 0x9FFF),)),
+}
+
+
+def _base_lang(code: str) -> str:
+    return (code or "").lower().split("-")[0].strip()
+
 
 def _lang_name(code: str) -> str:
-    return _LANG_NAMES.get((code or "").lower().split("-")[0], code or "the target language")
+    return _LANG_NAMES.get(_base_lang(code), code or "the target language")
+
+
+def _script_ratio(text: str, ranges: tuple[tuple[int, int], ...]) -> float:
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return 0.0
+    hits = sum(1 for c in letters if any(lo <= ord(c) <= hi for lo, hi in ranges))
+    return hits / len(letters)
+
+
+def _normalize(text: str) -> str:
+    cleaned = re.sub(r"[^\w\s]", " ", (text or "").lower(), flags=re.UNICODE)
+    return " ".join(cleaned.split())
+
+
+def _word_count(text: str) -> int:
+    return len(re.findall(r"\w{2,}", text or "", flags=re.UNICODE))
+
+
+def check_translation(source: str, output: str, target: str) -> str | None:
+    """Return a human-readable reason when `output` is not a real translation.
+
+    Returns None when the line looks genuinely translated.
+    """
+    output = (output or "").strip()
+    if not output:
+        return "empty output"
+    # Very short lines (a brand name, "Okay.", an interjection) can legitimately
+    # survive a good translation unchanged, so they are not judged.
+    if _word_count(source) < 3:
+        return None
+
+    src_norm, out_norm = _normalize(source), _normalize(output)
+    if out_norm and out_norm == src_norm:
+        return "output is identical to the source line"
+
+    entry = _TARGET_SCRIPTS.get(_base_lang(target))
+    if entry:
+        # A wrong script is the strongest signal that the model echoed the source.
+        name, ranges = entry
+        ratio = _script_ratio(output, ranges)
+        if ratio < MIN_TARGET_SCRIPT_RATIO:
+            return (f"only {ratio:.0%} of letters are {name}; expected at least "
+                    f"{MIN_TARGET_SCRIPT_RATIO:.0%} (model likely echoed the source)")
+    elif src_norm and out_norm:
+        if difflib.SequenceMatcher(None, src_norm, out_norm).ratio() >= MAX_SOURCE_SIMILARITY:
+            return "output is near-identical to the source line"
+    return None
 
 
 def _clean_llm_output(text: str) -> str:
     # Strip reasoning blocks some models emit, then surrounding quotes/labels.
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
-    # Drop a leading "Translation:" style prefix if present.
     text = re.sub(r"^\s*(translation|translated|output)\s*[:\-]\s*", "", text, flags=re.IGNORECASE)
     return text.strip().strip('"').strip("'").strip()
 
 
-def _build_prompt(text: str, *, source: str, target: str, context: list[str], target_duration_ms: int) -> tuple[str, str]:
+def _build_prompt(text: str, *, source: str, target: str, context: list[str],
+                  target_duration_ms: int, strict: bool = False) -> tuple[str, str]:
     src_name = _lang_name(source)
     tgt_name = _lang_name(target)
     target_sec = max(0.5, target_duration_ms / 1000.0)
     # Native conversational tempo: ~2.5 - 3.0 words per second
     max_words = max(3, int(target_sec * 2.8))
+    script_name = (_TARGET_SCRIPTS.get(_base_lang(target)) or (None, None))[0]
 
     system = (
         f"You are a master voice dubbing localizer adapting {src_name} speech into conversational, "
@@ -69,8 +175,15 @@ def _build_prompt(text: str, *, source: str, target: str, context: list[str], ta
         "Do NOT use formal, bookish, or elongated sentence structures. Keep it concise, punchy, and modern.\n"
         "3. Technical Terms & Loan Words: Adapt technical terms naturally for Indian speech "
         "(e.g. use standard words like Python, GitHub, scrape, website, free, open source, AI, API).\n"
-        "4. Output ONLY the localized line — no quotes, no explanations, no notes."
+        f"4. Output ONLY the localized {tgt_name} line — no quotes, no explanations, no notes."
     )
+    if strict:
+        system += (
+            f"\n\nCRITICAL: Your previous reply was not usable. Reply ONLY in {tgt_name}"
+            + (f", written in the {script_name} script" if script_name else "")
+            + f". Never repeat the {src_name} sentence back. Output one single {tgt_name} line and nothing else."
+        )
+
     ctx = "\n".join(context[-3:])
     user = (
         (f"Context from earlier dialogue:\n{ctx}\n\n" if ctx else "")
@@ -80,9 +193,11 @@ def _build_prompt(text: str, *, source: str, target: str, context: list[str], ta
     return system, user
 
 
-def _ollama_translate(text: str, *, source: str, target: str, context: list[str], target_duration_ms: int) -> str | None:
+def _ollama_translate(text: str, *, source: str, target: str, context: list[str],
+                      target_duration_ms: int, strict: bool = False) -> str | None:
     host = settings.ollama_host.rstrip("/")
-    system, user = _build_prompt(text, source=source, target=target, context=context, target_duration_ms=target_duration_ms)
+    system, user = _build_prompt(text, source=source, target=target, context=context,
+                                 target_duration_ms=target_duration_ms, strict=strict)
     try:
         r = httpx.post(
             f"{host}/api/chat",
@@ -98,22 +213,23 @@ def _ollama_translate(text: str, *, source: str, target: str, context: list[str]
             timeout=120.0,
         )
         if r.status_code != 200:
+            # Previously swallowed in silence, which is how a dead Ollama looked
+            # exactly like a successful job.
+            log.warning("Ollama translation HTTP %s from %s (model=%s): %s",
+                        r.status_code, host, settings.ollama_model, r.text[:200])
             return None
-        content = _clean_llm_output((r.json().get("message") or {}).get("content") or "")
-        return content or None
-    except Exception:
+        return _clean_llm_output((r.json().get("message") or {}).get("content") or "") or None
+    except Exception as exc:  # noqa: BLE001 - reported to the caller, not raised
+        log.warning("Ollama translation call to %s failed: %s", host, exc)
         return None
 
 
-import logging
-
-log = logging.getLogger(__name__)
-
-
-def _openai_translate(text: str, *, source: str, target: str, context: list[str], target_duration_ms: int) -> str | None:
+def _openai_translate(text: str, *, source: str, target: str, context: list[str],
+                      target_duration_ms: int, strict: bool = False) -> str | None:
     """Any OpenAI-compatible chat API (OpenAI, Groq, DeepSeek, OpenRouter, Ollama /v1, ...)."""
     base = settings.openai_base_url.rstrip("/")
-    system, user = _build_prompt(text, source=source, target=target, context=context, target_duration_ms=target_duration_ms)
+    system, user = _build_prompt(text, source=source, target=target, context=context,
+                                 target_duration_ms=target_duration_ms, strict=strict)
     headers = {"Content-Type": "application/json"}
     if settings.openai_api_key:
         headers["Authorization"] = f"Bearer {settings.openai_api_key}"
@@ -140,11 +256,56 @@ def _openai_translate(text: str, *, source: str, target: str, context: list[str]
         if not choices:
             log.warning("OpenAI translation returned empty choices: %s", r.text[:200])
             return None
-        content = _clean_llm_output((choices[0].get("message") or {}).get("content") or "")
-        return content or None
-    except Exception as e:
-        log.warning("OpenAI translation call failed: %s", e)
+        return _clean_llm_output((choices[0].get("message") or {}).get("content") or "") or None
+    except Exception as exc:  # noqa: BLE001
+        log.warning("OpenAI translation call failed: %s", exc)
         return None
+
+
+def _translator_fn():
+    if settings.translator == "ollama":
+        return _ollama_translate, f"ollama:{settings.ollama_model} @ {settings.ollama_host}"
+    if settings.translator == "openai":
+        return _openai_translate, f"openai:{settings.openai_model} @ {settings.openai_base_url}"
+    if settings.translator == "demo":
+        return None, "demo"
+    raise TranslationError(
+        f"Unknown translator {settings.translator!r}. Set DUBSTUDIO_TRANSLATOR to "
+        f"'ollama', 'openai' or 'demo'."
+    )
+
+
+def preflight(*, source_language: str, target_language: str) -> str:
+    """Verify the translator works BEFORE translating a whole video.
+
+    Returns the engine description. Raises TranslationError with an actionable
+    message when the endpoint is down, the model is missing, or the model just
+    echoes the source text back.
+    """
+    fn, desc = _translator_fn()
+    if fn is None:
+        log.warning("translator=demo — output will be a word-for-word demo map, not a translation")
+        return desc
+
+    probe = "Today I will show you how this tool works, step by step."
+    reply = fn(probe, source=source_language or "en", target=target_language,
+               context=[], target_duration_ms=3000)
+    if not reply:
+        raise TranslationError(
+            f"Translator unreachable: {desc} returned nothing. "
+            f"Check the service is running and the model is pulled "
+            f"(e.g. `ollama list` / `ollama pull {settings.ollama_model}`), or set "
+            f"DUBSTUDIO_TRANSLATOR=openai with DUBSTUDIO_OPENAI_API_KEY."
+        )
+    reason = check_translation(probe, reply, target_language)
+    if reason:
+        raise TranslationError(
+            f"Translator {desc} is reachable but is not translating into "
+            f"{_lang_name(target_language)} ({reason}). Model replied: {reply[:160]!r}. "
+            f"Try a stronger model (DUBSTUDIO_OLLAMA_MODEL)."
+        )
+    log.info("Translation preflight OK via %s", desc)
+    return desc
 
 
 def translate_segments(
@@ -153,51 +314,122 @@ def translate_segments(
     source_language: str,
     target_language: str,
     job: dict | None = None,
+    allow_partial: bool | None = None,
 ) -> list[dict[str, Any]]:
+    if allow_partial is None:
+        allow_partial = not bool(getattr(settings, "strict_translation", True))
+
+    fn, desc = _translator_fn()
+    if fn is not None:
+        preflight(source_language=source_language, target_language=target_language)
+
+    attempts = max(1, int(getattr(settings, "translation_attempts", 2)))
     context: list[str] = []
+    failures: list[tuple[str, str]] = []
     total = len(segments)
+
     for i, seg in enumerate(segments):
         if job and job.get("job_id") and total > 0:
             try:
                 from dubstudio.jobs.store import store
 
-                pct = 58 + int((i / total) * 7)
-                job["percent"] = min(pct, 64)
+                job["percent"] = min(58 + int((i / total) * 7), 64)
                 job["message"] = f"Translating segment {i + 1}/{total}"
                 store.save(job)
             except Exception:
                 pass
+
         text = seg.get("source_text") or ""
-        translated = None
-        dur = int(seg.get("target_duration_ms") or 2000)
-        if settings.translator == "ollama":
-            translated = _ollama_translate(text, source=source_language or "en", target=target_language, context=context, target_duration_ms=dur)
-        elif settings.translator == "openai":
-            translated = _openai_translate(text, source=source_language or "en", target=target_language, context=context, target_duration_ms=dur)
-        if not translated:
-            log.warning("LLM translation failed for segment %s; using simple fallback map", seg.get("segment_id"))
-            translated = _simple_map(text, target_language)
+        seg_id = seg.get("segment_id") or f"index_{i}"
+
+        if fn is None:  # demo mode, explicitly selected
+            seg["translated_text"] = _simple_map(text, target_language)
+            seg["translation_engine"] = "demo"
+            seg["status"] = "translated"
+            continue
+
+        if not text.strip():
+            seg["translated_text"] = ""
+            seg["translation_engine"] = desc
+            seg["status"] = "translated"
+            continue
+
+        translated, reason = None, "no attempt made"
+        for attempt in range(1, attempts + 1):
+            candidate = fn(text, source=source_language or "en", target=target_language,
+                           context=context,
+                           target_duration_ms=int(seg.get("target_duration_ms") or 2000),
+                           strict=attempt > 1)
+            if not candidate:
+                reason = "translator returned nothing"
+                log.warning("Segment %s attempt %d/%d: %s", seg_id, attempt, attempts, reason)
+                continue
+            reason = check_translation(text, candidate, target_language) or ""
+            if not reason:
+                translated = candidate
+                break
+            log.warning("Segment %s attempt %d/%d rejected: %s", seg_id, attempt, attempts, reason)
+
+        if translated is None:
+            seg["translated_text"] = ""
+            seg["status"] = "translation_failed"
+            seg["error"] = reason or "translation failed"
+            seg["translation_engine"] = desc
+            failures.append((seg_id, seg["error"]))
+            continue
+
         try:
             from dubstudio.util.phonetics import normalize_hinglish
 
             translated = normalize_hinglish(translated, target_language)
         except Exception:
             pass
+
         seg["translated_text"] = translated
+        seg["translation_engine"] = desc
         seg["status"] = "translated"
+        seg.pop("error", None)
         context.append(f"{text} => {translated}")
+
+    if failures:
+        head = "; ".join(f"{sid}: {why}" for sid, why in failures[:5])
+        msg = (f"{len(failures)}/{total} segment(s) were not translated via {desc}. "
+               f"First failures — {head}")
+        if not allow_partial:
+            raise TranslationError(msg)
+        log.error("%s (continuing because strict_translation is off)", msg)
+
     return segments
+
+
+def verify_segments_translated(segments: list[dict[str, Any]], target_language: str) -> list[str]:
+    """Return the ids of segments whose stored translation is unusable.
+
+    Used on resume so a cached bad `segments.json` is re-translated instead of
+    being replayed into synthesis.
+    """
+    bad: list[str] = []
+    for i, seg in enumerate(segments):
+        src = (seg.get("source_text") or "").strip()
+        if not src:
+            continue
+        if check_translation(src, seg.get("translated_text") or "", target_language):
+            bad.append(seg.get("segment_id") or f"index_{i}")
+    return bad
 
 
 def run_translation(job_dir: Path, job: dict) -> list[dict]:
     path = job_dir / "segments" / "segments.json"
     data = json.loads(path.read_text(encoding="utf-8"))
     segments = data if isinstance(data, list) else data.get("segments", [])
-    segments = translate_segments(
-        segments,
-        source_language=job.get("source_language") or "en",
-        target_language=job.get("target_language") or "hi",
-        job=job,
-    )
-    path.write_text(json.dumps(segments, indent=2, ensure_ascii=False), encoding="utf-8")
+    try:
+        segments = translate_segments(
+            segments,
+            source_language=job.get("source_language") or "en",
+            target_language=job.get("target_language") or "hi",
+            job=job,
+        )
+    finally:
+        # Always persist what we have so failures stay inspectable on disk.
+        path.write_text(json.dumps(segments, indent=2, ensure_ascii=False), encoding="utf-8")
     return segments
