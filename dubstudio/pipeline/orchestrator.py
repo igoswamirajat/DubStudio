@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 
 from dubstudio.jobs.states import require_transition, PIPELINE_STAGES
 from dubstudio.jobs.store import store
@@ -15,7 +16,7 @@ from dubstudio.pipeline.separation import run_separation
 from dubstudio.pipeline.synthesis import run_synthesis
 from dubstudio.pipeline.timing import run_timing
 from dubstudio.pipeline.transcription import run_transcription
-from dubstudio.pipeline.translation import run_translation
+from dubstudio.pipeline.translation import run_translation, verify_segments_translated
 from dubstudio.pipeline.voice_enroll import run_enroll
 from dubstudio.settings import settings
 
@@ -57,6 +58,23 @@ def _load_transcript(job_dir) -> dict | None:
         except Exception:
             return None
     return None
+
+
+def _stale_translation(job_dir: Path, target_language: str) -> list[str]:
+    """Ids of cached segments that are not actually translated.
+
+    A checkpointed `segments.json` can hold source-language text (translator
+    was down, model echoed the input, ...). Replaying it would dub the video
+    in its original language, so the stage has to be re-run.
+    """
+    path = job_dir / "segments" / "segments.json"
+    try:
+        cached = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return [f"segments.json unreadable ({exc})"]
+    if not isinstance(cached, list):
+        cached = cached.get("segments", [])
+    return verify_segments_translated(cached, target_language)
 
 
 def run_job(job_id: str) -> dict:
@@ -114,7 +132,10 @@ def run_job(job_id: str) -> dict:
     job = store.get(job_id)
     if not job.get("source_language"):
         job["source_language"] = transcript.get("language") or "en"
-        store.save(job)
+    # Make a demo / low-coverage transcript visible in the UI, not just the log.
+    job["asr_engine_used"] = transcript.get("engine")
+    job["warnings"] = list(transcript.get("warnings") or [])
+    store.save(job)
 
     # --- diarization ---
     _advance(job_id, "diarizing", 40, "Detecting speakers")
@@ -135,7 +156,16 @@ def run_job(job_id: str) -> dict:
 
     # --- translation ---
     job = store.get(job_id)
-    _advance(job_id, "translating", 58, f"Translating to {job.get('target_language')}")
+    target_lang = job.get("target_language") or "hi"
+    _advance(job_id, "translating", 58, f"Translating to {target_lang}")
+    if done("translating"):
+        stale = _stale_translation(job_dir, target_lang)
+        if stale:
+            log.warning(
+                "Job %s: discarding cached translation — %d segment(s) are not in %s (%s)",
+                job_id, len(stale), target_lang, ", ".join(str(s) for s in stale[:5]),
+            )
+            clear_from(job_dir, "translating")
     if not done("translating"):
         job = store.get(job_id)
         run_translation(job_dir, job)
