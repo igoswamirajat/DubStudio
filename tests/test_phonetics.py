@@ -76,8 +76,8 @@ def test_normalize_hinglish_repeated_pass_preserves_names():
 
 
 def test_normalize_hinglish_common_vocabulary_unchanged():
-    assert normalize_hinglish("install cloud code download upload API LLM URL") == (
-        "इंस्टॉल क्लाउड कोड डाउनलोड अपलोड ए.पी.आई. एल.एल.एम. यू.आर.एल."
+    assert normalize_hinglish("install cloud और code download upload API LLM URL") == (
+        "इंस्टॉल क्लाउड और कोड डाउनलोड अपलोड ए.पी.आई. एल.एल.एम. यू.आर.एल."
     )
 
 
