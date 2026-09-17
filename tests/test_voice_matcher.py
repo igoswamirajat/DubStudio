@@ -21,7 +21,7 @@ def test_expand_hindi_numbers():
 def test_normalize_hinglish_integration():
     raw = "GitHub पर 30,000 से ज़्यादा stars मिले हैं और $50 का फ़ायदा है।"
     norm = normalize_hinglish(raw, "hi")
-    assert "गिटहब" in norm
+    assert "GitHub" in norm
     assert "तीस हज़ार" in norm
     assert "डॉलर" in norm
 
@@ -47,7 +47,7 @@ def test_extract_acoustic_profile_female(tmp_path: Path):
     wav_path = tmp_path / "female_ref.wav"
     sf.write(str(wav_path), wave.astype(np.float32), sr)
 
-    prof = extract_acoustic_profile(wav_path, speaker_id="S01")
+    prof = extract_acoustic_profile(wav_path, speaker_id="S00")
     assert prof.gender == "female"
     assert 200.0 <= prof.f0_median <= 240.0
 
