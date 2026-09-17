@@ -47,7 +47,7 @@ def test_extract_acoustic_profile_female(tmp_path: Path):
     wav_path = tmp_path / "female_ref.wav"
     sf.write(str(wav_path), wave.astype(np.float32), sr)
 
-    prof = extract_acoustic_profile(wav_path, speaker_id="S00")
+    prof = extract_acoustic_profile(wav_path, speaker_id="S01")
     assert prof.gender == "female"
     assert 200.0 <= prof.f0_median <= 240.0
 
