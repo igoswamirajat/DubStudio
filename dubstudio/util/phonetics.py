@@ -93,6 +93,29 @@ TECH_TERMS_HI: dict[str, str] = {
     "application": "एप्लिकेशन",
 }
 
+# Known Latin product/brand names take precedence over the legacy phonetic map.
+# This is an explicit allowlist, not general named-entity detection. Keep source
+# spelling/case; do not guess reverse transliterations of Devanagari input.
+DO_NOT_TRANSLITERATE: frozenset[str] = frozenset({
+    "scrapegraphai", "scrapegraph", "chatgpt", "gpt-4", "gpt-4o",
+    "openai", "claude", "claude code", "gemini", "ollama",
+    "huggingface", "hugging face", "deepseek", "groq", "anthropic",
+    "github", "docker", "chrome", "harness", "cloud code",
+})
+
+# Capture complete names longest-first, including horizontal whitespace variants.
+# Splitting keeps protected spans out of number, term, and acronym replacement
+# without placeholders that could collide with user text or be normalized.
+_PROTECTED_NAME_PATTERN = re.compile(
+    r"\b("
+    + "|".join(
+        r"[ \t]+".join(re.escape(word) for word in name.split())
+        for name in sorted(DO_NOT_TRANSLITERATE, key=lambda name: (-len(name), name))
+    )
+    + r")\b",
+    re.IGNORECASE,
+)
+
 _PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\b" + re.escape(term) + r"\b", re.IGNORECASE), repl)
     for term, repl in sorted(TECH_TERMS_HI.items(), key=lambda x: -len(x[0]))
@@ -196,24 +219,23 @@ def expand_hindi_numbers(text: str) -> str:
 
 
 def normalize_hinglish(text: str, target_lang: str = "hi") -> str:
-    """Transliterate technical and English loan words to clean phonetic Devanagari.
+    """Normalize Hindi loan words while preserving known Latin product names.
 
-    This ensures Indian TTS models (such as Maya Research Veena) pronounce technical
-    terms and English code-switching smoothly without awkward accent shifts, hesitation,
-    or robotic distortion.
+    Common technical vocabulary and acronyms retain their phonetic Devanagari
+    forms for TTS. Protected names keep their source spelling and case, including
+    digits in listed model names. Other languages are returned unchanged.
     """
     if not text or target_lang != "hi":
         return text or ""
 
-    # 1. Expand numbers to spoken Hindi words
-    result = expand_hindi_numbers(text)
+    parts = _PROTECTED_NAME_PATTERN.split(text)
+    # Captured names occupy odd positions and bypass every normalization stage.
+    for index in range(0, len(parts), 2):
+        result = expand_hindi_numbers(parts[index])
+        for pat, repl in _PATTERNS:
+            result = pat.sub(repl, result)
+        for pat, repl in _ACRONYM_PATTERNS:
+            result = pat.sub(repl, result)
+        parts[index] = result
 
-    # 2. Transliterate technical terms and loan words
-    for pat, repl in _PATTERNS:
-        result = pat.sub(repl, result)
-
-    # 3. Transliterate acronyms
-    for pat, repl in _ACRONYM_PATTERNS:
-        result = pat.sub(repl, result)
-
-    return re.sub(r"[ \t]+", " ", result).strip()
+    return re.sub(r"[ \t]+", " ", "".join(parts)).strip()
