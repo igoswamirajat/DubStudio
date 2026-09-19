@@ -2,34 +2,24 @@ from __future__ import annotations
 
 import re
 
-# Comprehensive phonetic mappings for technical, programming, AI, and web terms
-# mapped to clean Devanagari representations that Indian neural TTS engines pronounce
-# with authentic native prosody, zero code-switching hesitation, and no robotic glitches.
+# ---------------------------------------------------------------------------
+# Two kinds of English word come back from the translator and they need opposite
+# treatment before the TTS sees them.
+#
+#   * NAMES - products, brands, companies and languages (see PROPER_NOUNS
+#     below). These stay in Latin script, exactly as their owners write them: a
+#     viewer reads "DeepSeek", never "डीपसीक", and "गिटहब" reads as a
+#     mis-transliteration rather than as GitHub. The Latin words the translator
+#     already leaves alone (install, plugin, version) reach the engine fine, so
+#     names ride that same path.
+#
+#   * GENERIC technical vocabulary - install, cloud, plugin, API. These have
+#     settled Devanagari spellings that Indian neural TTS engines pronounce with
+#     authentic native prosody, zero code-switching hesitation and no robotic
+#     glitches, so they are transliterated below.
+# ---------------------------------------------------------------------------
 TECH_TERMS_HI: dict[str, str] = {
-    # AI & Tools
-    "scrapegraphai": "स्क्रैपग्राफ़ एआई",
-    "scrapegraph": "स्क्रैपग्राफ़",
-    "chatgpt": "चैट जीपीटी",
-    "gpt-4": "जीपीटी फोर",
-    "gpt-4o": "जीपीटी फोर ओ",
-    "gpt": "जीपीटी",
-    "openai": "ओपन एआई",
-    "claude": "क्लॉड",
-    "gemini": "जेमिनी",
-    "ollama": "ओलामा",
-    "huggingface": "हगिंगफ़ेस",
-    "hugging face": "हगिंगफ़ेस",
-    "deepseek": "डीपसीक",
-    "groq": "ग्रॉक",
-    "anthropic": "एंथ्रोपिक",
-
-    # Programming & Tech
-    "python": "पायथन",
-    "javascript": "जावास्क्रिप्ट",
-    "typescript": "टाइपस्क्रिप्ट",
-    "github": "गिटहब",
-    "git": "गिट",
-    "docker": "डॉकर",
+    # Generic technical vocabulary
     "api": "ए.पी.आई.",
     "apis": "ए.पी.आई.ज़",
     "llm": "एल.एल.एम.",
@@ -78,7 +68,6 @@ TECH_TERMS_HI: dict[str, str] = {
     "files": "फ़ाइल्स",
     "link": "लिंक",
     "browser": "ब्राउज़र",
-    "chrome": "क्रोम",
     "extension": "एक्सटेंशन",
     "prompt": "प्रॉम्प्ट",
     "prompts": "प्रॉम्प्ट्स",
@@ -93,33 +82,41 @@ TECH_TERMS_HI: dict[str, str] = {
     "application": "एप्लिकेशन",
 }
 
-# Known Latin product/brand names take precedence over the legacy phonetic map.
-# This is an explicit allowlist, not general named-entity detection. Keep source
-# spelling/case; do not guess reverse transliterations of Devanagari input.
-DO_NOT_TRANSLITERATE: frozenset[str] = frozenset({
-    "scrapegraphai", "scrapegraph", "chatgpt", "gpt-4", "gpt-4o",
-    "openai", "claude", "claude code", "gemini", "ollama",
-    "huggingface", "hugging face", "deepseek", "groq", "anthropic",
-    "github", "docker", "chrome", "harness", "cloud code",
+# Proper nouns: product, brand, company and language names. These must survive
+# in Latin script - transliterating them is what turned "DeepSeek" into
+# "डीपसीक" and "GitHub" into "गिटहब" in the dub. Matching is word-bounded and
+# case-insensitive, and the original spelling is handed back untouched, so
+# "GitHub" stays "GitHub" and "GitHub's" keeps its apostrophe.
+PROPER_NOUNS: frozenset[str] = frozenset({
+    # AI models, tools and the companies behind them
+    "scrapegraphai", "scrapegraph",
+    "chatgpt", "gpt-4", "gpt-4o", "gpt",
+    "openai", "claude", "gemini", "ollama", "huggingface", "hugging face",
+    "deepseek", "groq", "anthropic", "harness", "copilot", "cursor", "codex",
+    # Developer platforms, tools and languages
+    "github", "git", "docker", "chrome",
+    "python", "javascript", "typescript",
+    # Multi-word product names - the longest match wins, so these beat the
+    # generic entries they contain ("cloud", "code").
+    "cloud code", "vs code", "visual studio code", "google cloud",
 })
-
-# Capture complete names longest-first, including horizontal whitespace variants.
-# Splitting keeps protected spans out of number, term, and acronym replacement
-# without placeholders that could collide with user text or be normalized.
-_PROTECTED_NAME_PATTERN = re.compile(
-    r"\b("
-    + "|".join(
-        r"[ \t]+".join(re.escape(word) for word in name.split())
-        for name in sorted(DO_NOT_TRANSLITERATE, key=lambda name: (-len(name), name))
-    )
-    + r")\b",
-    re.IGNORECASE,
-)
 
 _PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\b" + re.escape(term) + r"\b", re.IGNORECASE), repl)
     for term, repl in sorted(TECH_TERMS_HI.items(), key=lambda x: -len(x[0]))
 ]
+
+_PROPER_NOUN_PATTERNS: list[re.Pattern] = [
+    re.compile(r"\b" + re.escape(name) + r"\b", re.IGNORECASE)
+    for name in sorted(PROPER_NOUNS, key=lambda x: -len(x))
+]
+
+# Sentinels used to park a protected name while the other passes run. They come
+# from the Unicode private use area: not letters (so the \b boundaries around
+# the terms still being matched are undisturbed) and not digits (so the number
+# expander cannot rewrite a parked slot index, which is exactly how "gpt-4"
+# used to come out as "gpt-चार").
+_HOLD_BASE = 0xE000
 
 _ACRONYMS = {
     "URL": "यू.आर.एल.",
@@ -219,23 +216,43 @@ def expand_hindi_numbers(text: str) -> str:
 
 
 def normalize_hinglish(text: str, target_lang: str = "hi") -> str:
-    """Normalize Hindi loan words while preserving known Latin product names.
+    """Transliterate technical and English loan words to clean phonetic Devanagari.
 
-    Common technical vocabulary and acronyms retain their phonetic Devanagari
-    forms for TTS. Protected names keep their source spelling and case, including
-    digits in listed model names. Other languages are returned unchanged.
+    This ensures Indian TTS models (such as Maya Research Veena) pronounce technical
+    terms and English code-switching smoothly without awkward accent shifts, hesitation,
+    or robotic distortion.
+
+    Proper nouns are the exception: names stay in Latin script (see PROPER_NOUNS).
     """
     if not text or target_lang != "hi":
         return text or ""
 
-    parts = _PROTECTED_NAME_PATTERN.split(text)
-    # Captured names occupy odd positions and bypass every normalization stage.
-    for index in range(0, len(parts), 2):
-        result = expand_hindi_numbers(parts[index])
-        for pat, repl in _PATTERNS:
-            result = pat.sub(repl, result)
-        for pat, repl in _ACRONYM_PATTERNS:
-            result = pat.sub(repl, result)
-        parts[index] = result
+    # 1. Park proper nouns first, so none of the passes below can touch them.
+    #    This has to happen before number expansion: "gpt-4" is a name, not a
+    #    quantity, and expanding its digit would leave "gpt-चार" behind.
+    held: list[str] = []
+    result = text
 
-    return re.sub(r"[ \t]+", " ", "".join(parts)).strip()
+    def _park(match: re.Match) -> str:
+        held.append(match.group(0))
+        return chr(_HOLD_BASE + len(held) - 1)
+
+    for pat in _PROPER_NOUN_PATTERNS:
+        result = pat.sub(_park, result)
+
+    # 2. Expand numbers to spoken Hindi words
+    result = expand_hindi_numbers(result)
+
+    # 3. Transliterate technical terms and loan words
+    for pat, repl in _PATTERNS:
+        result = pat.sub(repl, result)
+
+    # 4. Transliterate acronyms
+    for pat, repl in _ACRONYM_PATTERNS:
+        result = pat.sub(repl, result)
+
+    # 5. Hand the names back exactly as they were written.
+    for idx, name in enumerate(held):
+        result = result.replace(chr(_HOLD_BASE + idx), name)
+
+    return re.sub(r"[ \t]+", " ", result).strip()

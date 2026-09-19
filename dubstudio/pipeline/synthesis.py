@@ -10,6 +10,7 @@ from dubstudio.engines.base import SynthRequest
 from dubstudio.engines.factory import get_voice_engine
 from dubstudio.jobs.store import store
 from dubstudio.pipeline.blocks import blocks_path, load_blocks, run_blocks
+from dubstudio.util.paths import rel_posix
 
 log = logging.getLogger("dubstudio.synthesis")
 
@@ -139,7 +140,7 @@ def _render_segment(pool: _EnginePool, job_dir: Path, seg: dict, entry: dict, la
                         attempt, ATTEMPTS_PER_SEGMENT, entry["engine"], exc)
             continue
 
-        seg["generated_wav"] = str(out.relative_to(job_dir))
+        seg["generated_wav"] = rel_posix(out, job_dir)
         seg["generated_duration_ms"] = result.duration_ms
         seg["status"] = "synthesized"
         seg["tts_engine"] = result.engine
@@ -192,7 +193,7 @@ def _render_block(pool: _EnginePool, job_dir: Path, block: dict, entry: dict, la
                         attempt, ATTEMPTS_PER_SEGMENT, entry["engine"], exc)
             continue
 
-        block["generated_wav"] = str(out.relative_to(job_dir))
+        block["generated_wav"] = rel_posix(out, job_dir)
         block["generated_duration_ms"] = result.duration_ms
         block["status"] = "synthesized"
         block["tts_engine"] = result.engine

@@ -21,7 +21,9 @@ def test_expand_hindi_numbers():
 def test_normalize_hinglish_integration():
     raw = "GitHub पर 30,000 से ज़्यादा stars मिले हैं और $50 का फ़ायदा है।"
     norm = normalize_hinglish(raw, "hi")
+    # The name stays Latin; the quantities around it still get spelled out.
     assert "GitHub" in norm
+    assert "गिटहब" not in norm
     assert "तीस हज़ार" in norm
     assert "डॉलर" in norm
 

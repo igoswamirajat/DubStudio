@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from dubstudio.util.paths import rel_posix
 
 
 def run_enroll(job_dir: Path, speaker_overrides: dict | None = None, job: dict | None = None) -> dict:
@@ -59,7 +60,7 @@ def run_enroll(job_dir: Path, speaker_overrides: dict | None = None, job: dict |
             "speaker_id": sid,
             "ref_start": start,
             "ref_end": end,
-            "ref_wav": str(ref.relative_to(job_dir)),
+            "ref_wav": rel_posix(ref, job_dir),
             "ref_text": best_text,
             "segment_count": len(segs),
             "segs": segs,

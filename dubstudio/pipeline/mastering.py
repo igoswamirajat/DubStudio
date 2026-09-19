@@ -27,7 +27,12 @@ log = logging.getLogger("dubstudio.mastering")
 RAW_NAME = "final.raw.wav"
 
 
-def master_job(job_dir, *, target_lufs: float = L.MASTER_LUFS) -> dict:
+def master_job(job_dir, *, target_lufs: float = L.MASTER_LUFS, run_gate: bool = True) -> dict:
+    """Normalise mix/final.wav, then (optionally) grade the job.
+
+    `run_gate=False` is for the pipeline, where export grades the job again once
+    the mp4 exists - that second pass is the one that can see the A/V streams.
+    """
     job_dir = Path(job_dir)
     mix_dir = job_dir / "mix"
     final = mix_dir / "final.wav"
@@ -66,7 +71,7 @@ def master_job(job_dir, *, target_lufs: float = L.MASTER_LUFS) -> dict:
     mix_dir.mkdir(parents=True, exist_ok=True)
     qc_path.write_text(json.dumps(qc, indent=2), encoding="utf-8")
 
-    return {"master": info, "gate": Q.run_qc(job_dir)}
+    return {"master": info, "gate": Q.run_qc(job_dir) if run_gate else {}}
 
 
 def main(argv=None) -> int:

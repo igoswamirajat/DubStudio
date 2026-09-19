@@ -32,6 +32,16 @@ ROOM_TONE_EDGE_S = 0.015
 MIN_HOLE_S = 0.35           # an uncovered speech window this long is reported
 MIN_COVERAGE = 0.95         # below this the mix is flagged "degraded"
 
+# --- hybrid bed -------------------------------------------------------------
+# Separation is only needed where somebody is talking. Everywhere else the
+# original full mix IS the bed, and running it through a two-stem separator can
+# only lose things: laughter, crowd, screams and door slams get filed under
+# "vocals" and are then deleted from the bed for good. So the separated bed is
+# used only inside the speech windows and the original is kept bit-exact
+# outside them, joined by an equal-power crossfade.
+HYBRID_PAD_S = 0.15         # separated bed reaches this far past the speech
+HYBRID_FADE_S = 0.040       # equal-power crossfade at each boundary
+
 
 # --- interval helpers -------------------------------------------------------
 def _merge(intervals, bridge_gap_s: float = 0.0) -> list[tuple[float, float]]:
@@ -205,6 +215,44 @@ def _speech_mask(
         mask = np.convolve(mask, np.ones(ramp, dtype=np.float32) / ramp, mode="same")
         mask = np.clip(mask, 0.0, 1.0)
     return mask
+
+
+def _as_stereo(x: np.ndarray) -> np.ndarray:
+    """Promote a mono signal to (n, 2) so bed and original can be blended."""
+    x = np.asarray(x, dtype=np.float32)
+    if x.ndim == 1:
+        return np.column_stack([x, x])
+    if x.shape[1] == 1:
+        return np.column_stack([x[:, 0], x[:, 0]])
+    return x[:, :2]
+
+
+def _hybrid_bed(
+    full: np.ndarray,
+    separated: np.ndarray,
+    speech: list[tuple[float, float]],
+    n: int,
+    sr: int,
+) -> np.ndarray:
+    """Original mix outside the speech windows, separated bed inside them.
+
+    Demucs only has to work where somebody is talking. Outside the speech the
+    original is already the bed, bit-exact and full-band, and separating it can
+    only delete whatever the two-stem model decided was a voice. The two are
+    joined with an equal-power crossfade, so the boundary is a level-matched
+    blend rather than a step.
+    """
+    full = _as_stereo(full)[:n]
+    sep = _as_stereo(separated)[:n]
+    if len(full) < n:
+        full = np.pad(full, ((0, n - len(full)), (0, 0)))
+    if len(sep) < n:
+        sep = np.pad(sep, ((0, n - len(sep)), (0, 0)))
+
+    g = _speech_mask(speech, n, sr, pad_s=HYBRID_PAD_S, ramp_s=HYBRID_FADE_S)[:, None]
+    # cos/sin rather than a straight lerp: 1 - g would dip in level through the
+    # transition where the two sides are uncorrelated.
+    return (full * np.cos(g * (np.pi / 2.0)) + sep * np.sin(g * (np.pi / 2.0))).astype(np.float32)
 
 
 def _highpass(x: np.ndarray, sr: int, cutoff: float = 80.0) -> np.ndarray:
@@ -477,6 +525,26 @@ def run_mixing(
     holes_over_1s = sum(1 for a, b in report_holes if b - a >= 1.0)
     largest_hole = max((b - a for a, b in report_holes), default=0.0)
 
+    # 7b. Hybrid bed: the original bit-exact wherever nobody is talking.
+    hybrid = False
+    full_stereo = None
+    full_path = job_dir / "audio" / "full.wav"
+    if full_path.exists() and src_windows:
+        try:
+            full, _ = read_audio(full_path, target_sr=sr, mono=False)
+            full_stereo = _as_stereo(full)[:n]
+            if len(full_stereo) < n:
+                full_stereo = np.pad(full_stereo, ((0, n - len(full_stereo)), (0, 0)))
+            if full.ndim == 1 or full.shape[1] < 2:
+                # A degraded separation writes a mono silent bed; the original
+                # is stereo, so take the layout from the original instead of
+                # letting a failed stem collapse the whole mix to mono.
+                is_stereo = True
+            bed = _hybrid_bed(full, bed, src_windows, n, sr)
+            hybrid = True
+        except Exception as exc:  # noqa: BLE001 - fall back to the plain bed
+            log.warning("Hybrid bed unavailable (%s); using the separated bed alone", exc)
+
     # 8. Room tone: inside a talking run the dialogue bus must never sit at
     #    digital zero, otherwise every line starts from -inf dB and each pause
     #    sounds like the track dropped out.
@@ -511,10 +579,16 @@ def run_mixing(
     # 10. Restore original NON-SPEECH audio only (laughter, chimes, reactions).
     #     Gated by the SOURCE speech windows, never by the dub's amplitude, so a
     #     quiet or missing dub can no longer bring the original speaker back.
-    guard = list(covered) if restore_original_on_failure else list(src_windows)
-    residual_gate = 1.0 - _speech_mask(guard, n, sr)
+    #
+    #     With the hybrid bed the original is already carried bit-exact outside
+    #     the speech windows, so adding the residual on top would double every
+    #     non-speech sound. It is only still needed for
+    #     restore_original_on_failure, which is the one path that puts the
+    #     source speaker back inside the holes.
     residual = np.zeros_like(bed)
-    if voc is not None:
+    if voc is not None and (restore_original_on_failure or not hybrid):
+        guard = list(covered) if restore_original_on_failure else list(src_windows)
+        residual_gate = 1.0 - _speech_mask(guard, n, sr)
         voc_stereo = voc if voc.ndim > 1 else np.column_stack([voc, voc])
         if len(voc_stereo) < n:
             voc_stereo = np.pad(voc_stereo, ((0, n - len(voc_stereo)), (0, 0)))[:n]
@@ -531,6 +605,32 @@ def run_mixing(
     else:
         mix = (bed.squeeze() if bed.ndim > 1 else bed) * duck + dialogue + residual
     mix = _soft_limit(mix)
+
+    # 11b. Non-speech null test.
+    #      Outside the speech, with the bed at unity gain, the mix should be the
+    #      original. It is measured here rather than in qc.py because only this
+    #      function knows both the speech mask and the duck envelope, so it can
+    #      exclude the bed's release ramp - otherwise the ramp is mistaken for
+    #      bed damage and the number is meaningless.
+    null_info: dict = {}
+    if hybrid and full_stereo is not None:
+        guard = _speech_mask(src_windows, n, sr, pad_s=HYBRID_PAD_S, ramp_s=HYBRID_FADE_S)
+        clean = (guard < 1e-6) & (duck >= 0.999)
+        window_s = float(clean.sum()) / sr
+        if clean.sum() >= int(0.25 * sr):
+            a = mix[clean].reshape(-1).astype(np.float64)
+            b = full_stereo[clean].reshape(-1).astype(np.float64)
+            energy = float(np.sum(b * b))
+            if energy > 1e-12:
+                gain = float(np.sum(a * b) / energy)
+                residual = a - gain * b
+                resid_rms = float(np.sqrt(np.mean(residual ** 2)))
+                ref_rms = float(np.sqrt(np.mean((gain * b) ** 2)))
+                null_info = {
+                    "null_test_db": round(20.0 * np.log10(max(resid_rms, 1e-12) / max(ref_rms, 1e-12)), 1),
+                    "null_test_gain_db": round(20.0 * np.log10(max(abs(gain), 1e-12)), 2),
+                    "null_test_window_s": round(window_s, 2),
+                }
 
     # 12. Artifacts + QC report
     mix_dir = job_dir / "mix"
@@ -562,7 +662,11 @@ def run_mixing(
         "max_join_gap_ms": max(join_gaps_ms) if join_gaps_ms else 0,
         "room_tone_rms": round(room_level, 5),
         "original_restored": bool(restore_original_on_failure),
+        # "hybrid" means the non-speech audio is the untouched original;
+        # "separated" means the whole bed went through Demucs.
+        "bed_mode": "hybrid" if hybrid else "separated",
     }
+    qc.update(null_info)
     (mix_dir / "qc.json").write_text(json.dumps(qc, indent=2), encoding="utf-8")
     if failed_segments:
         log.error("Mixed with %d failed segment(s): %s", len(failed_segments), failed_segments)

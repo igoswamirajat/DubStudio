@@ -8,6 +8,9 @@ data/*.db
 web/dist/
 *.egg-info/
 .pytest_cache/
+.pytest_tmp/
+scratch/
+.workbuddy-ai/
 *.wav
 *.mp4
 !tests/fixtures/.gitkeep

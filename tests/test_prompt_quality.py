@@ -76,6 +76,24 @@ def test_budget_is_capped_by_what_was_actually_said():
     assert lo < hi
 
 
+def test_budget_shrinks_when_the_slot_is_mostly_pause():
+    """A nine second slot around a six word line is mostly silence.
+
+    Filling it would take about twenty-five words; the cap keeps the request
+    near what was actually said, so the model cannot pad it out with filler.
+    """
+    lo, hi = T._word_budget("one two three four five six", 9.8, "hi")
+    assert hi <= 9, f"asked for {lo}-{hi} words for a six word line"
+    assert lo < hi
+
+
+def test_measured_speech_duration_wins_over_the_source_proxy():
+    # speech_duration_ms is the real signal. Here the speaker really did fill
+    # most of the 9.8s slot, so the full allowance is correct again.
+    lo, hi = T._word_budget("one two three four five six", 9.8, "hi", 6000)
+    assert hi >= 9, f"a slot that is 60% speech should not be treated as a pause: {lo}-{hi}"
+
+
 def test_a_short_line_is_flagged_and_a_fitting_line_is_not():
     assert T._length_issue(EN, HI_SHORT, "hi", 4000) is not None
     assert T._length_issue(EN, HI_FIT, "hi", 4000) is None
@@ -123,6 +141,40 @@ def test_prompt_names_the_target_script_for_borrowed_words():
     assert "Spanish" in system_es
 
 
+def test_prompt_keeps_names_in_latin_script():
+    """The bug: product names came back as डीपसीक and गिटहब.
+
+    The prompt has to separate names from generic tech vocabulary, because the
+    two are treated differently downstream.
+    """
+    system, _ = T._build_prompt(EN, source="en", target="hi", context=[],
+                                target_duration_ms=4000)
+    assert "Never transliterate a name" in system
+    for name in ("DeepSeek", "GitHub", "Harness", "Cloud Code"):
+        assert name in system, name
+
+
+def test_prompt_bans_filler():
+    system, _ = T._build_prompt(EN, source="en", target="hi", context=[],
+                                target_duration_ms=4000)
+    assert "NO FILLER" in system
+    assert "no empty connectors" in system
+
+
+def test_prompt_preserves_a_pause_instead_of_filling_it():
+    # Three words in a ten second slot: the speaker paused, and the dub must
+    # not be padded out to cover the silence.
+    _, user = T._build_prompt("Okay, let's go.", source="en", target="hi",
+                              context=[], target_duration_ms=10000)
+    assert "paused" in user
+    assert "Do not pad" in user
+
+    # A slot the source actually fills gets no such note.
+    _, full = T._build_prompt(EN, source="en", target="hi", context=[],
+                              target_duration_ms=4000)
+    assert "paused" not in full
+
+
 def test_prompt_carries_the_previous_lines():
     ctx = ["Hello there => नमस्ते", "This is a test => यह एक टेस्ट है"]
     _, user = T._build_prompt(EN, source="en", target="hi", context=ctx,
@@ -158,10 +210,11 @@ def test_next_line_is_given_as_context_only():
 def test_internal_markers_never_reach_the_model():
     ctx = ["Hello there => नमस्ते",
            T.NEXT_MARK + "And that is it.",
-           T.FLOW_MARK + T.FLOW_CONTINUES]
+           T.FLOW_MARK + T.FLOW_CONTINUES,
+           T.SPEECH_MARK + "2400"]
     system, user = T._build_prompt(EN, source="en", target="hi", context=ctx,
                                    target_duration_ms=4000)
-    for marker in ("[NEXT]", "[FLOW]"):
+    for marker in ("[NEXT]", "[FLOW]", "[SPEECH]"):
         assert marker not in system
         assert marker not in user
 
@@ -277,3 +330,25 @@ def test_a_wrong_length_line_is_kept_not_failed():
     assert out[0]["translated_text"] == HI_SHORT
     assert out[0]["translation_words"] == 2
     assert "words" in out[0]["translation_note"]
+
+
+def test_segment_speech_duration_reaches_the_prompt():
+    """The prompt has to know whether the slot is a pause or time to fill.
+
+    speech_duration_ms rides inside `context` so that every translator callable
+    keeps its fixed signature.
+    """
+    seen: dict[str, int | None] = {}
+
+    def fn(text, *, source, target, context, target_duration_ms, strict=False):
+        _, _, _, speech_ms = T._split_context(context)
+        seen[text] = speech_ms
+        return HI_FIT
+
+    settings.translator = "ollama"
+    T._ollama_translate = fn
+    seg = _seg(0, EN, 4000)
+    seg["speech_duration_ms"] = 2400
+    T.translate_segments([seg], source_language="en", target_language="hi")
+
+    assert seen[EN] == 2400

@@ -90,6 +90,75 @@ def test_unknown_engine_falls_back_to_dummy():
     assert eng.name == "dummy"
 
 
+# --- OmniVoice pacing -------------------------------------------------------
+# Regression for job_01M2JTG79S269HPHSZ5ETB64ED, where OmniVoice ignored
+# target_duration_ms, spoke Hindi at 4.34 w/s against a 2.6 w/s budget, and left
+# 5.6s of dead air in the dub.
+
+def test_pacing_uses_slot_length_when_text_can_fill_it():
+    from dubstudio.engines.omnivoice_engine import _pacing_duration_s
+
+    # 60 Hindi words in a 20.64s slot: the engine's natural floor is
+    # 60/1.8 = 33s, so the slot is the binding request.
+    text = " ".join(["शब्द"] * 60)
+    req = SynthRequest(text=text, language="hi", voice_id="S00", ref_wav=None,
+                       target_duration_ms=20640)
+    assert _pacing_duration_s(req) == 20.64
+
+
+def test_pacing_never_asks_for_a_drawl():
+    from dubstudio.engines.omnivoice_engine import _pacing_duration_s
+
+    # Five words cannot plausibly fill a 20s slot; ask for a natural length
+    # instead of stretching them out.
+    req = SynthRequest(text=" ".join(["शब्द"] * 5), language="hi", voice_id="S00",
+                       ref_wav=None, target_duration_ms=20000)
+    pacing = _pacing_duration_s(req)
+    assert pacing is not None
+    assert pacing < 5.0
+
+
+def test_pacing_absent_without_a_target():
+    from dubstudio.engines.omnivoice_engine import _pacing_duration_s
+
+    req = SynthRequest(text="कुछ शब्द", language="hi", voice_id="S00", ref_wav=None)
+    assert _pacing_duration_s(req) is None
+
+    req_zero = SynthRequest(text="कुछ शब्द", language="hi", voice_id="S00", ref_wav=None,
+                            target_duration_ms=0)
+    assert _pacing_duration_s(req_zero) is None
+
+
+def test_pacing_ignores_degenerate_slots():
+    from dubstudio.engines.omnivoice_engine import _pacing_duration_s
+
+    req = SynthRequest(text="कुछ शब्द यहाँ", language="hi", voice_id="S00", ref_wav=None,
+                       target_duration_ms=120)
+    assert _pacing_duration_s(req) is None
+
+
+def test_generate_passes_duration_to_the_model(monkeypatch, tmp_path: Path):
+    """The engine must actually forward the pacing request to OmniVoice."""
+    from dubstudio.engines import omnivoice_engine as mod
+
+    captured: dict = {}
+
+    class FakeModel:
+        def generate(self, **kwargs):
+            captured.update(kwargs)
+            import numpy as np
+            return [np.zeros(24000, dtype=np.float32)]
+
+    eng = mod.OmniVoiceEngine()
+    eng._model = FakeModel()
+    out = tmp_path / "paced.wav"
+    req = SynthRequest(text=" ".join(["शब्द"] * 60), language="hi", voice_id="S00",
+                       ref_wav=None, target_duration_ms=20640)
+    eng.generate(req, out)
+    assert captured.get("duration") == 20.64
+    assert captured.get("language") == "hi"
+
+
 def test_veena_snac_deinterleaving():
     import pytest
     try:

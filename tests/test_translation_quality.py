@@ -154,6 +154,48 @@ def test_demo_mode_only_runs_when_selected():
 
 
 # --------------------------------------------------------------------------
+# filler: padding a line out to reach the word count
+# --------------------------------------------------------------------------
+def test_a_line_that_repeats_itself_is_flagged():
+    out = "यह एक बात है यह एक बात है और बस"
+    reason = T._filler_issue(EN, out, "hi", 4000)
+    assert reason is not None
+    assert "repeat" in reason
+
+
+def test_an_empty_connector_on_an_over_budget_line_is_flagged():
+    src = "one two three four five six"
+    out = "जब आप request भेजते हैं तो यह काम करता है और बहुत अच्छा है दोस्तों"
+    reason = T._filler_issue(src, out, "hi", 2000)
+    assert reason is not None
+    assert "filler" in reason
+
+
+def test_a_clean_line_is_not_called_filler():
+    # Long, but every word is doing work - over budget is not the same as padded.
+    assert T._filler_issue(EN, HI, "hi", 4000) is None
+
+
+def test_a_padded_line_earns_one_rewrite_and_is_kept():
+    calls = {"n": 0}
+
+    def fn(text, *, source, target, context, target_duration_ms, strict=False):
+        if text.startswith(PROBE_PREFIX):
+            return HI
+        calls["n"] += 1
+        return "यह एक बात है यह एक बात है और बस"
+
+    settings.translator = "ollama"
+    settings.translation_attempts = 2
+    T._ollama_translate = fn
+    out = T.translate_segments([_seg()], source_language="en", target_language="hi")
+
+    assert calls["n"] == 2, "the padded line should be sent back once, strictly"
+    assert out[0]["status"] == "translated"
+    assert "repeat" in out[0]["translation_note"]
+
+
+# --------------------------------------------------------------------------
 # resume guard
 # --------------------------------------------------------------------------
 def test_verify_segments_translated_flags_cached_bad_output():

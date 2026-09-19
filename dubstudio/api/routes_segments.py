@@ -15,6 +15,7 @@ from dubstudio.pipeline.export import run_export
 from dubstudio.pipeline.mixing import run_mixing
 from dubstudio.pipeline.timing import run_timing
 from dubstudio.settings import settings
+from dubstudio.util.paths import rel_posix
 
 router = APIRouter()
 
@@ -115,7 +116,7 @@ def resynth_segment(job_id: str, segment_id: str, body: ResynthBody | None = Non
         ),
         out,
     )
-    found["generated_wav"] = str(out.relative_to(job_dir))
+    found["generated_wav"] = rel_posix(out, job_dir)
     found["generated_duration_ms"] = result.duration_ms
     found["status"] = "synthesized"
     _save(job_id, segments)

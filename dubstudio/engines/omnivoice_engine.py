@@ -20,6 +20,44 @@ from dubstudio.engines.base import SynthRequest, SynthResult, VoiceEngine
 log = logging.getLogger("dubstudio.omnivoice")
 OMNIVOICE_SR = 24000
 
+# --- pacing -----------------------------------------------------------------
+# OmniVoice's own pace for Hindi is far quicker than the words-per-second the
+# translation budget is written against. Measured on job
+# job_01M2JTG79S269HPHSZ5ETB64ED: 60 Hindi words came back in 13.82s, i.e.
+# 4.34 w/s, while translation.py sized the line for 2.6 w/s. Every block
+# therefore under-filled its slot by 18-33%, the aligner can only absorb +-8%
+# without mangling the delivery, and the remainder shipped as dead air (5.6s of
+# silence over a talking presenter, QC status "degraded").
+#
+# The engine accepts a target `duration` and meets it by budgeting its own
+# audio tokens, so one pass is enough - no extra generation, and the aligner
+# then has nothing left to stretch. Verified: asking for 20.64s returned 20.84s
+# where the unpaced call returned 13.82s.
+MIN_NATURAL_WPS = 1.8      # conservative floor; never ask the engine to drawl
+MIN_TARGET_DURATION_S = 0.5
+
+
+def _spoken_words(text: str) -> int:
+    """Script-agnostic word count (Devanagari combining marks break ``\\w``)."""
+    return sum(1 for tok in (text or "").split() if any(ch.isalnum() for ch in tok))
+
+
+def _pacing_duration_s(req: SynthRequest) -> float | None:
+    """Seconds to ask OmniVoice for, or None to leave its own pace alone."""
+    if not req.target_duration_ms or req.target_duration_ms <= 0:
+        return None
+    target = req.target_duration_ms / 1000.0
+    if target < MIN_TARGET_DURATION_S:
+        return None
+    words = _spoken_words(req.text)
+    if words:
+        # Stretching a handful of words across a long slot only produces a
+        # drawl, so cap the request at a plausible natural length. Whatever is
+        # still missing stays visible in QC instead of being hidden inside
+        # mangled pacing.
+        target = min(target, words / MIN_NATURAL_WPS)
+    return round(target, 3)
+
 
 class OmniVoiceEngine(VoiceEngine):
     name = "omnivoice"
@@ -109,7 +147,14 @@ class OmniVoiceEngine(VoiceEngine):
         if req.language:
             kwargs.setdefault("language", req.language)
 
-        log.debug("OmniVoice generate mode=%s keys=%s", mode, list(kwargs.keys()))
+        # Ask for the slot length so the engine paces itself to fill it. Without
+        # this the engine returns its own (much quicker) pace and the shortfall
+        # becomes dead air at mix time.
+        pacing = _pacing_duration_s(req)
+        if pacing is not None:
+            kwargs["duration"] = pacing
+
+        log.debug("OmniVoice generate mode=%s pacing=%ss keys=%s", mode, pacing, list(kwargs.keys()))
         
         try:
             audio = self._model.generate(**kwargs)

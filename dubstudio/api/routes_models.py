@@ -76,6 +76,23 @@ MODELS_CATALOG = [
 ]
 
 
+def _env_file_path() -> Path | None:
+    """Where the model-cache setting is persisted.
+
+    Resolved from the installed package location, never from the process CWD,
+    and overridable with ``DUBSTUDIO_ENV_FILE`` so a test run cannot rewrite the
+    developer's real ``.env``. Returns None when no .env should be touched
+    (e.g. a packaged/deployed install with no project root).
+    """
+    override = os.environ.get("DUBSTUDIO_ENV_FILE", "").strip()
+    if override:
+        return Path(override)
+    project_root = Path(__file__).resolve().parents[2]
+    if (project_root / "pyproject.toml").is_file():
+        return project_root / ".env"
+    return None
+
+
 def _get_active_storage_dir() -> Path:
     """Return effective HuggingFace / models cache directory."""
     if settings.hf_home:
@@ -175,18 +192,22 @@ def set_storage(payload: UpdateStoragePayload):
     settings.hf_home = str(new_path.resolve())
     os.environ["HF_HOME"] = str(new_path.resolve())
 
-    # Persist to .env
-    try:
-        env_file = Path(".env")
-        lines = []
-        if env_file.exists():
-            for line in env_file.read_text(encoding="utf-8").splitlines():
-                if not line.startswith("DUBSTUDIO_HF_HOME="):
-                    lines.append(line)
-        lines.append(f"DUBSTUDIO_HF_HOME={new_path.resolve()}")
-        env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    except Exception as exc:
-        log.warning("Could not persist HF_HOME to .env: %s", exc)
+    # Persist to .env so the choice survives a restart. Silently skipped when
+    # there is no project .env to write (or when a test redirected it).
+    env_file = _env_file_path()
+    if env_file is None:
+        log.debug("No project .env to persist HF_HOME into; runtime value only")
+    else:
+        try:
+            lines = []
+            if env_file.exists():
+                for line in env_file.read_text(encoding="utf-8").splitlines():
+                    if not line.startswith("DUBSTUDIO_HF_HOME="):
+                        lines.append(line)
+            lines.append(f"DUBSTUDIO_HF_HOME={new_path.resolve()}")
+            env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except Exception as exc:
+            log.warning("Could not persist HF_HOME to .env: %s", exc)
 
     return _disk_stats(new_path)
 

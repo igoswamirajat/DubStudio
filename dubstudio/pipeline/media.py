@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from dubstudio.util.ffmpeg import extract_wav, probe
+from dubstudio.util.paths import rel_posix
 
 
 def run_extract(job_dir: Path) -> dict:
@@ -20,8 +21,8 @@ def run_extract(job_dir: Path) -> dict:
     full = audio_dir / "full.wav"
     extract_wav(src, full, sample_rate=48000)
     return {
-        "source_path": str(src.relative_to(job_dir)),
-        "full_wav": str(full.relative_to(job_dir)),
+        "source_path": rel_posix(src, job_dir),
+        "full_wav": rel_posix(full, job_dir),
         "duration_s": duration,
         "meta": meta,
     }

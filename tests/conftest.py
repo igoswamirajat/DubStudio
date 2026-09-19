@@ -9,6 +9,36 @@ from dubstudio.settings import settings
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
+PROJECT_ENV = Path(__file__).resolve().parents[1] / ".env"
+
+
+@pytest.fixture(scope="session")
+def project_env_target(tmp_path_factory) -> Path:
+    """One redirected .env for the whole run.
+
+    Session-scoped on purpose: a function-scoped ``mktemp`` here would create a
+    fresh directory for every single test, which is ~220 throwaway dirs per run.
+    """
+    return tmp_path_factory.mktemp("env") / ".env"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_project_env(project_env_target, monkeypatch):
+    """Stop any test from writing the developer's real project .env.
+
+    The models API persists the chosen HF cache into .env so it survives a
+    restart. Pointed at the CWD, that meant every test run rewrote the real
+    .env with a pytest tmp path - which then silently won over HF_HOME at the
+    next app start and sent model lookups to a deleted directory.
+    """
+    monkeypatch.setenv("DUBSTUDIO_ENV_FILE", str(project_env_target))
+    return project_env_target
+
+
+@pytest.fixture(scope="session")
+def project_env_path() -> Path:
+    return PROJECT_ENV
+
 
 @pytest.fixture(scope="session")
 def clip_8s(tmp_path_factory) -> Path:

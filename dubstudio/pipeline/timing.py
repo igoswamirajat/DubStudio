@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 from dubstudio.util.audio import duration_ms
+from dubstudio.util.paths import rel_posix
 
 DEFAULT_MAX_STRETCH = 0.25
 
@@ -130,7 +131,7 @@ def run_timing(job_dir: Path, job: dict | None = None, *, max_stretch: float = D
         src = job_dir / gen_rel
         out = timing_dir / f"{seg['segment_id']}.fitted.wav"
         info = fit_segment(src, out, int(seg.get("target_duration_ms") or 1000), max_stretch=max_stretch)
-        seg["fitted_wav"] = str(out.relative_to(job_dir))
+        seg["fitted_wav"] = rel_posix(out, job_dir)
         seg["generated_duration_ms"] = info["generated_duration_ms"]
         seg["fitted_duration_ms"] = info["fitted_duration_ms"]
         seg["stretch_ratio"] = info["stretch_ratio"]

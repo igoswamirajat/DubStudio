@@ -93,7 +93,11 @@ def job_dir(tmp_path: Path) -> Path:
     # The original speaker talks continuously through every window.
     voc = np.zeros(n, dtype=np.float32)
     for _sid, start, end, _amp, _pause in specs:
-        voc[int(start * SR):int(end * SR)] = _voiced(end - start, ORIG_F, 0.40)
+        # Derive the length from the integer sample bounds: int(end*SR) -
+        # int(start*SR) is not always int((end-start)*SR) (1.6*48000 rounds
+        # down), and the one-sample mismatch used to raise ValueError here.
+        i0, i1 = int(start * SR), int(end * SR)
+        voc[i0:i1] = _voiced((i1 - i0) / SR, ORIG_F, 0.40)
     chime = 0.25 * np.sin(2 * np.pi * SFX_F * np.arange(int(0.4 * SR), dtype=np.float32) / SR)
     voc[int(9.0 * SR):int(9.0 * SR) + len(chime)] = chime.astype(np.float32)
     sf.write(str(tmp_path / "audio" / "vocals.wav"), voc, SR)
@@ -168,3 +172,94 @@ def test_bed_is_ducked_behind_the_dub(mix):
 
 def test_mix_does_not_clip(mix):
     assert float(np.max(np.abs(mix))) <= 0.995
+
+
+# --- hybrid bed -------------------------------------------------------------
+# Two-stem Demucs files anything voice-like under "vocals", so a chime, a laugh
+# or a door slam can be deleted from the bed for good. The original full mix
+# still has it, and the hybrid bed is what puts it back bit-exact outside the
+# speech windows instead of leaning on the attenuated residual path.
+
+HYBRID_SPEECH = (0.50, 2.40)
+HYBRID_SFX = (9.05, 9.35)
+
+
+@pytest.fixture
+def hybrid_job(tmp_path: Path) -> Path:
+    """A job whose separator ate a non-speech sound out of the bed."""
+    for sub in ("audio", "synth", "segments"):
+        (tmp_path / sub).mkdir(parents=True, exist_ok=True)
+    n = int(DURATION_S * SR)
+    t = np.arange(n, dtype=np.float32) / SR
+    sp0, sp1 = int(HYBRID_SPEECH[0] * SR), int(HYBRID_SPEECH[1] * SR)
+    fx0, fx1 = int(HYBRID_SFX[0] * SR), int(HYBRID_SFX[1] * SR)
+
+    voice = np.zeros(n, dtype=np.float32)
+    voice[sp0:sp1] = _voiced((sp1 - sp0) / SR, ORIG_F, 0.30)
+
+    chime = np.zeros(n, dtype=np.float32)
+    chime[fx0:fx1] = (0.15 * np.sin(2 * np.pi * SFX_F * (np.arange(fx1 - fx0) / SR))).astype(np.float32)
+
+    bed_l = 0.10 * np.sin(2 * np.pi * BED_F * t)
+    bed_r = 0.10 * np.sin(2 * np.pi * BED_F * t + 0.4)
+
+    # What the source actually contains.
+    full = np.column_stack([bed_l + voice + chime, bed_r + voice + chime]).astype(np.float32)
+    sf.write(str(tmp_path / "audio" / "full.wav"), full, SR)
+
+    # What Demucs handed back: the chime went to "vocals" and is gone from here.
+    separated = np.column_stack([bed_l, bed_r]).astype(np.float32)
+    sf.write(str(tmp_path / "audio" / "bed.wav"), separated, SR)
+
+    vocals = np.column_stack([voice + chime, voice + chime]).astype(np.float32)
+    sf.write(str(tmp_path / "audio" / "vocals.wav"), vocals, SR)
+
+    sf.write(str(tmp_path / "synth" / "seg0.wav"),
+             _voiced((sp1 - sp0) / SR, DUB_F, 0.30, mod=4.0), SR)
+    segments = [{
+        "segment_id": "seg0",
+        "start": HYBRID_SPEECH[0],
+        "end": HYBRID_SPEECH[1],
+        "speaker_id": "S00",
+        "target_duration_ms": int((HYBRID_SPEECH[1] - HYBRID_SPEECH[0]) * 1000),
+        "generated_wav": "synth/seg0.wav",
+        "status": "synthesized",
+    }]
+    (tmp_path / "segments" / "segments.json").write_text(json.dumps(segments), encoding="utf-8")
+    return tmp_path
+
+
+def test_hybrid_bed_is_used_when_the_original_is_available(hybrid_job):
+    run_mixing(hybrid_job, duration_s=DURATION_S)
+    qc = json.loads((hybrid_job / "mix" / "qc.json").read_text(encoding="utf-8"))
+    assert qc["bed_mode"] == "hybrid"
+
+
+def test_hybrid_bed_restores_a_sound_the_separator_deleted(hybrid_job):
+    """The chime the separator ate must come back at unity, not at -4 dB."""
+    run_mixing(hybrid_job, duration_s=DURATION_S)
+    mix, _ = sf.read(str(hybrid_job / "mix" / "final.wav"))
+    full, _ = sf.read(str(hybrid_job / "audio" / "full.wav"))
+
+    reference = _db(_band_rms(full, SFX_F, *HYBRID_SFX))
+    got = _db(_band_rms(mix, SFX_F, *HYBRID_SFX))
+    assert got > -30.0, f"chime was lost entirely ({got:.1f} dBFS)"
+    assert abs(got - reference) <= 0.5, (
+        f"chime came through at {got:.2f} dB, source had {reference:.2f} dB"
+    )
+
+
+def test_separated_bed_is_the_fallback_without_the_original(job_dir):
+    """No full.wav (older jobs) must keep working on the plain separated bed."""
+    run_mixing(job_dir, duration_s=DURATION_S)
+    qc = json.loads((job_dir / "mix" / "qc.json").read_text(encoding="utf-8"))
+    assert qc["bed_mode"] == "separated"
+
+
+def test_hybrid_bed_does_not_double_the_non_speech_audio(hybrid_job):
+    """Bed + residual would stack the same sound twice outside the speech."""
+    run_mixing(hybrid_job, duration_s=DURATION_S)
+    mix, _ = sf.read(str(hybrid_job / "mix" / "final.wav"))
+    full, _ = sf.read(str(hybrid_job / "audio" / "full.wav"))
+    # +6 dB would mean the original got added to itself.
+    assert _db(_band_rms(mix, SFX_F, *HYBRID_SFX)) - _db(_band_rms(full, SFX_F, *HYBRID_SFX)) < 3.0

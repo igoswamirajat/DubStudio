@@ -94,12 +94,35 @@ def _clip_like_stream() -> list[dict]:
     ]
 
 
+def _sentence_split_stream() -> list[dict]:
+    """Two full utterances whose only split is a short punctuation break.
+
+    SPLIT_PAUSE_S is 0.70, so a sub-threshold pause normally stays inside one
+    utterance. After sentence-final punctuation PUNCT_PAUSE_S (0.28s) is enough
+    to split - and that is the case where the leftover 0.30s gap has to be
+    absorbed so the two slots stay contiguous. Each side is over MIN_SEG_S so
+    the min-length merge cannot undo the split.
+    """
+    return [
+        w("aa", 0.00, 0.70), w("bb.", 0.80, 1.50),
+        w("cc", 1.80, 2.60), w("dd", 2.70, 3.40),
+    ]
+
+
 def test_absorbed_gap_makes_slots_contiguous():
-    cues = words_to_segments(_clip_like_stream(), job_id="j", min_seg_s=0.0)
+    cues = words_to_segments(_sentence_split_stream(), job_id="j", min_seg_s=0.0)
+    assert len(cues) == 2, "a sentence break should split the two utterances"
     absorbed = [i for i in range(len(cues) - 1) if cues[i]["absorbed_gap"]]
-    assert absorbed, "expected at least one sub-0.35s gap to be absorbed"
+    assert absorbed, "expected the sub-0.35s gap to be absorbed"
     for i in absorbed:
         assert abs(cues[i]["slot_end"] - cues[i + 1]["start"]) < 1e-6
+
+
+def test_a_gap_over_the_absorb_limit_is_not_absorbed():
+    """Only sub-ABSORB_GAP_S gaps get welded; a real pause must survive."""
+    cues = words_to_segments(_clip_like_stream(), job_id="j", min_seg_s=0.0)
+    assert len(cues) == 2
+    assert not any(c["absorbed_gap"] for c in cues)
 
 
 def test_genuine_pause_is_preserved():

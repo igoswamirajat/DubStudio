@@ -10,6 +10,7 @@ from dubstudio.pipeline.checkpoint import clear_from, is_done, mark_done
 from dubstudio.pipeline.diarization import run_diarization
 from dubstudio.pipeline.export import run_export
 from dubstudio.pipeline.media import run_extract
+from dubstudio.pipeline.mastering import master_job
 from dubstudio.pipeline.mixing import run_mixing
 from dubstudio.pipeline.segments import words_to_segments
 from dubstudio.pipeline.separation import run_separation
@@ -189,6 +190,30 @@ def run_job(job_id: str) -> dict:
     return store.get(job_id)
 
 
+def _master(job_dir: Path) -> dict:
+    """Normalise the finished mix to the delivery target.
+
+    master_job() existed but nothing in the pipeline ever called it - only the
+    `python -m dubstudio.pipeline.mastering` CLI - so every job shipped at
+    whatever level mixing happened to land on (job 8 came out at -18.4 LUFS
+    against a -16 target and failed the gate on loudness alone).
+
+    Advisory, like the gate: a failure here must not throw away a good render.
+    The untouched mix is kept as mix/final.raw.wav by master_job itself.
+    """
+    try:
+        result = master_job(job_dir, run_gate=False)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Mastering failed, shipping the unnormalised mix: %s", exc)
+        return {}
+    info = (result or {}).get("master") or {}
+    if info:
+        log.info("Mastered %s: %+.2f dB -> %.2f LUFS, %.2f dBTP",
+                 job_dir.name, info.get("gain_db", 0.0),
+                 info.get("output_lufs", 0.0), info.get("true_peak_dbtp", 0.0))
+    return result or {}
+
+
 def _apply_voice_selections(job_dir: Path) -> None:
     """Re-read speaker_map.json (updated by user selections) and propagate voice_id to all segments."""
     map_path = job_dir / "voices" / "speaker_map.json"
@@ -252,6 +277,7 @@ def run_job_synthesis(job_id: str) -> dict:
     _advance(job_id, "mixing", 92, "Mixing dialogue with bed")
     if not done("mixing"):
         run_mixing(job_dir, duration_s)
+        _master(job_dir)
         mark_done(job_dir, "mixing")
 
     # --- export (always, to publish artifact paths) ---

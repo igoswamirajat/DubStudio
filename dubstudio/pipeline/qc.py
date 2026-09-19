@@ -23,6 +23,7 @@ import numpy as np
 
 from dubstudio.pipeline import loudness as L
 from dubstudio.util.audio import read_audio
+from dubstudio.util.ffmpeg import probe
 
 log = logging.getLogger("dubstudio.qc")
 
@@ -36,6 +37,24 @@ TRUE_PEAK_SLACK_DB = 0.2
 MIN_DIALOGUE_TOP_HZ = 12000.0    # below this the voice sounds muffled
 MAX_BANDWIDTH_DEFICIT_HZ = 3000.0
 MIN_DUCK_DEPTH_DB = 8.0
+
+# --- non-speech null test ---------------------------------------------------
+# Outside the speech windows the dub should be a bit-exact passthrough of the
+# original: that is the whole point of the hybrid bed, and it is the only way
+# "the music and SFX are untouched" can be checked instead of assumed. One
+# scalar gain is fitted first, because the mix is legitimately allowed to be a
+# different loudness than the source; what is left after that is the damage.
+NULL_PAD_S = 0.60                # clears the duck's hold + release, not just the speech
+NULL_PASS_DB = -24.0             # residual this far under the reference
+NULL_WARN_DB = -14.0
+# A talking-head video can leave only a fraction of a second with nobody
+# speaking; that is still 10k+ samples of RMS, enough to catch a bed that was
+# mangled, so measure it rather than skipping.
+MIN_NULL_WINDOW_S = 0.25         # not enough clean non-speech -> skip
+
+# --- A/V sync ---------------------------------------------------------------
+MAX_AV_OFFSET_MS = 25.0          # under a frame at 30 fps
+MAX_AV_LENGTH_DELTA_MS = 40.0    # mix and picture must be the same length
 
 PASS = "pass"
 WARN = "warn"
@@ -52,6 +71,122 @@ def _num(data: dict, key: str):
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _stereo(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    if x.ndim == 1:
+        return np.column_stack([x, x])
+    if x.shape[1] == 1:
+        return np.column_stack([x[:, 0], x[:, 0]])
+    return x[:, :2]
+
+
+def _speech_guard(job_dir: Path, n: int, sr: int) -> np.ndarray | None:
+    """1.0 wherever the source was speaking (plus a guard band), else 0.0."""
+    path = job_dir / "segments" / "segments.json"
+    if not path.exists():
+        return None
+    try:
+        segments = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    mask = np.zeros(n, dtype=np.float32)
+    pad = int(round(NULL_PAD_S * sr))
+    for seg in segments or []:
+        try:
+            start, end = float(seg.get("start") or 0.0), float(seg.get("end") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if end <= start:
+            continue
+        i0 = max(0, int(round(start * sr)) - pad)
+        i1 = min(n, int(round(end * sr)) + pad)
+        if i1 > i0:
+            mask[i0:i1] = 1.0
+    return mask
+
+
+def _null_test(job_dir: Path) -> dict:
+    """Measure the original surviving untouched in the non-speech regions.
+
+    Returns ``{"null_test_db": <float>}`` where the number is the residual,
+    after removing the best-fit gain, relative to the reference. Bit-exact
+    passthrough lands far below -40 dB; a mix that ran the whole bed through
+    the separator, or that stacked the original on top of itself, does not.
+    """
+    final = job_dir / "mix" / "final.wav"
+    full = job_dir / "audio" / "full.wav"
+    if not final.exists() or not full.exists():
+        return {}
+    try:
+        mix, sr = read_audio(final, target_sr=48000, mono=False)
+        ref, _ = read_audio(full, target_sr=48000, mono=False)
+    except Exception as exc:
+        log.warning("null test could not read its inputs: %s", exc)
+        return {}
+
+    mix, ref = _stereo(mix), _stereo(ref)
+    n = min(len(mix), len(ref))
+    if n <= 0:
+        return {}
+    guard = _speech_guard(job_dir, n, sr)
+    if guard is None:
+        return {}
+
+    keep = guard[:n] < 1e-6
+    if int(keep.sum()) < int(MIN_NULL_WINDOW_S * sr):
+        return {"null_test_window_s": round(float(keep.sum()) / sr, 2)}
+
+    a = mix[:n][keep].reshape(-1).astype(np.float64)
+    b = ref[:n][keep].reshape(-1).astype(np.float64)
+    energy = float(np.sum(b * b))
+    if energy <= 1e-12:
+        return {"null_test_window_s": round(float(keep.sum()) / sr, 2)}
+
+    gain = float(np.sum(a * b) / energy)
+    residual = a - gain * b
+    resid_rms = float(np.sqrt(np.mean(residual ** 2)))
+    ref_rms = float(np.sqrt(np.mean((gain * b) ** 2)))
+    null_db = 20.0 * np.log10(max(resid_rms, 1e-12) / max(ref_rms, 1e-12))
+    return {
+        "null_test_db": round(null_db, 1),
+        "null_test_gain_db": round(20.0 * np.log10(max(abs(gain), 1e-12)), 2),
+        "null_test_window_s": round(float(keep.sum()) / sr, 2),
+    }
+
+
+def _av_sync(job_dir: Path) -> dict:
+    """Compare the muxed audio and video streams: offset and total length."""
+    out = job_dir / "export" / "output.mp4"
+    if not out.exists():
+        return {}
+    try:
+        meta = probe(out)
+    except Exception as exc:
+        log.warning("could not probe %s: %s", out, exc)
+        return {}
+
+    video = next((s for s in meta.get("streams", []) if s.get("codec_type") == "video"), None)
+    audio = next((s for s in meta.get("streams", []) if s.get("codec_type") == "audio"), None)
+    if video is None or audio is None:
+        return {}
+
+    def _f(stream, key):
+        try:
+            return float(stream.get(key))
+        except (TypeError, ValueError):
+            return None
+
+    v_start, a_start = _f(video, "start_time"), _f(audio, "start_time")
+    v_dur, a_dur = _f(video, "duration"), _f(audio, "duration")
+
+    out: dict = {}
+    if v_start is not None and a_start is not None:
+        out["av_offset_ms"] = round(abs(a_start - v_start) * 1000.0, 1)
+    if v_dur is not None and a_dur is not None:
+        out["av_length_delta_ms"] = round(abs(a_dur - v_dur) * 1000.0, 1)
+    return out
 
 
 def _add(checks: list, cid: str, label: str, status: str,
@@ -157,6 +292,38 @@ def evaluate(qc: dict, measured: dict | None = None) -> dict:
              -MIN_DUCK_DEPTH_DB,
              "bed sits {:.1f} dB under the dialogue".format(abs(duck_depth)))
 
+    null_db = _num(data, "null_test_db")
+    if null_db is None:
+        _add(checks, "null_test", "Non-speech passthrough", SKIP,
+             message="no clean non-speech window to measure")
+    else:
+        if null_db <= NULL_PASS_DB:
+            status = PASS
+        elif null_db <= NULL_WARN_DB:
+            status = WARN
+        else:
+            status = FAIL
+        _add(checks, "null_test", "Non-speech passthrough", status, null_db, NULL_PASS_DB,
+             "music/SFX differ from the source by {:.1f} dB in the {}s where nobody "
+             "is talking".format(null_db, data.get("null_test_window_s", "?")))
+
+    av_offset = _num(data, "av_offset_ms")
+    if av_offset is None:
+        _add(checks, "av_offset", "A/V offset", SKIP, message="no exported file to probe")
+    else:
+        _add(checks, "av_offset", "A/V offset",
+             PASS if av_offset <= MAX_AV_OFFSET_MS else FAIL, av_offset, MAX_AV_OFFSET_MS,
+             "audio starts {:.0f} ms from the picture".format(av_offset))
+
+    av_delta = _num(data, "av_length_delta_ms")
+    if av_delta is None:
+        _add(checks, "av_length", "A/V length match", SKIP, message="no exported file to probe")
+    else:
+        _add(checks, "av_length", "A/V length match",
+             PASS if av_delta <= MAX_AV_LENGTH_DELTA_MS else FAIL, av_delta,
+             MAX_AV_LENGTH_DELTA_MS,
+             "audio and video differ in length by {:.0f} ms".format(av_delta))
+
     worst = max((_RANK[c["status"]] for c in checks), default=_RANK[SKIP])
     status = next(k for k, v in _RANK.items() if v == worst)
     return {
@@ -202,6 +369,8 @@ def measure(job_dir: Path) -> dict:
         except Exception as exc:
             log.warning("could not measure %s: %s", bed, exc)
 
+    out.update(_null_test(job_dir))
+    out.update(_av_sync(job_dir))
     return out
 
 
@@ -218,6 +387,12 @@ def run_qc(job_dir: Path, *, write: bool = True) -> dict:
             log.warning("unreadable qc.json: %s", exc)
 
     measured = measure(job_dir)
+    # run_mixing measures the null test against the duck envelope it built,
+    # which is strictly better than the fallback above (that one can only guess
+    # where the bed was at unity gain). Its number wins.
+    if qc.get("null_test_db") is not None:
+        for key in ("null_test_db", "null_test_gain_db", "null_test_window_s"):
+            measured.pop(key, None)
     gate = evaluate(qc, measured)
     gate["measured"] = measured
 

@@ -42,5 +42,8 @@ def test_full_pipeline_produces_mp4_and_srt(clip_8s, job_workspace, monkeypatch)
     segs = json.loads((job_dir / "segments" / "segments.json").read_text(encoding="utf-8"))
     assert len(segs) >= 1
     assert all(s.get("translated_text") for s in segs)
-    assert all(s.get("status") == "ok" for s in segs)
+    # A cue that was synthesised as part of a block is "in_block": its audio is
+    # the block's, not its own. Both are successes; only "failed" is not.
+    assert all(s.get("status") in {"ok", "in_block"} for s in segs)
+    assert all(s.get("fitted_wav") or s.get("block_wav") for s in segs)
     assert float(probe(out_mp4)["format"]["duration"]) >= 5.0

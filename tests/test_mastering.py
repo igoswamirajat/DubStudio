@@ -65,3 +65,43 @@ def test_mastering_a_job_with_no_mix_is_a_no_op(tmp_path):
     job = tmp_path / "empty"
     job.mkdir()
     assert M.master_job(job) == {}
+
+
+# --- pipeline wiring --------------------------------------------------------
+# master_job() existed but nothing in the pipeline called it, so every job
+# shipped at whatever level mixing landed on. Job 8 came out at -18.4 LUFS and
+# failed the gate on loudness alone.
+
+def test_run_gate_can_be_skipped_for_the_pipeline(tmp_path):
+    job = _job(tmp_path)
+    result = M.master_job(job, run_gate=False)
+    assert result["gate"] == {}
+    assert not (job / "mix" / "gate.json").exists()
+    # mastering itself still happened
+    assert abs(result["master"]["output_lufs"] - L.MASTER_LUFS) < 1.0
+
+
+def test_the_orchestrator_masters_the_mix(tmp_path, monkeypatch):
+    from dubstudio.pipeline import orchestrator as orch
+
+    job = _job(tmp_path)
+    orch._master(job)
+    data, sr = read_audio(job / "mix" / "final.wav", target_sr=SR, mono=True)
+    assert abs(L.lufs(data, sr) - L.MASTER_LUFS) < 1.0
+    assert (job / "mix" / "final.raw.wav").exists()
+
+
+def test_a_mastering_failure_does_not_lose_the_render(tmp_path, monkeypatch):
+    """Mastering is advisory: a crash must not throw away a good mix."""
+    from dubstudio.pipeline import orchestrator as orch
+
+    job = _job(tmp_path)
+    before, _ = read_audio(job / "mix" / "final.wav", target_sr=SR, mono=True)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("simulated mastering failure")
+
+    monkeypatch.setattr(orch, "master_job", boom)
+    assert orch._master(job) == {}
+    after, _ = read_audio(job / "mix" / "final.wav", target_sr=SR, mono=True)
+    assert np.array_equal(before, after)

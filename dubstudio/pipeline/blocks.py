@@ -24,6 +24,21 @@ MAX_BLOCK_CHARS = 700     # ... and inside their text limits
 MAX_SYNTH_PAUSE_S = 0.60  # longest pause we ask the engine to hold inside a block
 CLAUSE_PAUSE_MS = 250     # a pause this long deserves at least a comma
 
+# --- carry-over prosody ----------------------------------------------------
+# A block's slot length sets the pace the engine is asked for, and the slots are
+# derived from the ASR timings of whatever the speaker happened to do in each
+# run: a slow line followed by a fast one makes the *same* voice drawl and then
+# rush. The engine has no way to know it just spoke, so the rate is carried over
+# by hand - each speaker gets one smoothed words/sec across the whole video and
+# every block's target duration is re-derived from it. OmniVoice then paces
+# itself to that single rate instead of restarting its prosody contour at every
+# block boundary.
+MIN_NATURAL_WPS = 1.8     # never ask for a drawl (mirrors omnivoice_engine)
+MAX_NATURAL_WPS = 4.5     # never ask for a sprint
+RATE_SMOOTH_ALPHA = 0.5   # half the block's own implied rate, half what came before
+MAX_TARGET_SHIFT = 0.15   # a target may only move +-15% towards the smoothed rate
+RATE_FIX_THRESHOLD = 0.15 # only touch rates that actually disagree by more than this
+
 _SENT_END = ".?!\u0964\u2026"
 _TRAILING = "\"')]\u201d\u2019"
 _CLAUSE_END = ",;:\u060c\u3001\u2014-"
@@ -70,6 +85,117 @@ def _dubbable(seg: dict[str, Any]) -> bool:
     if (seg.get("status") or "") in {"failed", "translation_failed"}:
         return False
     return bool(_line(seg))
+
+
+def _spoken_words(text: str | None) -> int:
+    """Script-agnostic word count (Devanagari combining marks break ``\\w``)."""
+    return sum(1 for tok in (text or "").split() if any(ch.isalnum() for ch in tok))
+
+
+def _implied_wps(block: dict[str, Any]) -> float | None:
+    """Words/sec the block's slot would ask the engine for, or None if unknowable."""
+    words = _spoken_words(block.get("text"))
+    slot_s = (float(block.get("target_duration_ms") or 0)) / 1000.0
+    if words <= 0 or slot_s <= 0.05:
+        return None
+    return words / slot_s
+
+
+def _runway_s(blocks: list[dict[str, Any]], index: int, total_s: float | None) -> float | None:
+    """Seconds from this block's start until the next speech begins.
+
+    `None` when there is nothing after it and the video length is unknown: the
+    track simply ends, so there is no runway to respect and no reason to clamp.
+    """
+    start = _f(blocks[index], "start")
+    nxt = [b for b in blocks[index + 1:] if _f(b, "start") > start + 1e-6]
+    if nxt:
+        end = _f(nxt[0], "start")
+    elif total_s is not None:
+        end = total_s
+    else:
+        return None
+    return max(0.05, end - start)
+
+
+def smooth_block_rates(
+    blocks: list[dict[str, Any]],
+    *,
+    alpha: float = RATE_SMOOTH_ALPHA,
+    max_shift: float = MAX_TARGET_SHIFT,
+    min_wps: float = MIN_NATURAL_WPS,
+    max_wps: float = MAX_NATURAL_WPS,
+    total_s: float | None = None,
+) -> list[dict[str, Any]]:
+    """Carry one speaking rate per speaker across the whole video.
+
+    Each block's `target_duration_ms` is re-derived from an exponentially
+    smoothed words/sec for its speaker (EMA in timeline order, so the rate
+    carries forward rather than averaging a fast start and a slow end into one
+    wrong constant). The move is bounded: a target never shifts more than
+    `max_shift`, never leaves the natural-rate envelope, and never outgrows the
+    runway before the next line starts.
+
+    Jobs whose rates already agree (within `RATE_FIX_THRESHOLD`) are left
+    completely untouched - there is nothing to carry over.
+    """
+    ordered = sorted([b for b in (blocks or []) if b.get("block_id")], key=lambda b: _f(b, "start"))
+    by_speaker: dict[str, list[dict[str, Any]]] = {}
+    for block in ordered:
+        by_speaker.setdefault(str(block.get("speaker_id") or "S00"), []).append(block)
+
+    for sid, spk_blocks in by_speaker.items():
+        implied = [_implied_wps(b) for b in spk_blocks]
+        known = [r for r in implied if r is not None]
+        if len(known) < 2:
+            continue
+        # Already consistent? Leave the job exactly as it was.
+        lo, hi = min(known), max(known)
+        if lo > 0 and (hi / lo - 1.0) <= RATE_FIX_THRESHOLD:
+            continue
+
+        carried = known[0]
+        for block, rate in zip(spk_blocks, implied):
+            if rate is None:
+                continue
+            carried = alpha * rate + (1.0 - alpha) * carried
+            words = _spoken_words(block.get("text"))
+            slot_ms = int(block.get("target_duration_ms") or 0)
+            if words <= 0 or slot_ms <= 0:
+                continue
+
+            wanted_ms = int(round(words / carried * 1000.0))
+            floor_ms = int(round(words / max_wps * 1000.0))
+            ceil_ms = int(round(words / min_wps * 1000.0))
+            new_ms = int(max(
+                max(slot_ms * (1.0 - max_shift), floor_ms),
+                min(slot_ms * (1.0 + max_shift), ceil_ms, wanted_ms),
+            ))
+            # Never ask for more audio than the runway can hold; the timeline
+            # solver would only have to compress it straight back out. But a
+            # slot that already overruns its runway is the slot's problem, not
+            # ours - clamping below the original would speed the block up
+            # instead of easing it.
+            idx = ordered.index(block)
+            runway = _runway_s(ordered, idx, total_s)
+            if runway is not None:
+                runway_cap = int(runway * 1000.0 * 0.98)
+                new_ms = min(new_ms, max(runway_cap, slot_ms))
+            new_ms = max(1, new_ms)
+            if new_ms == slot_ms:
+                continue
+            block["target_duration_ms"] = new_ms
+            block.setdefault("prosody", {}).update({
+                "implied_wps": round(rate, 3),
+                "smoothed_wps": round(carried, 3),
+                "original_target_ms": slot_ms,
+                "target_shift_ms": new_ms - slot_ms,
+            })
+            log.info(
+                "Carry-over prosody %s: %.2f -> %.2f w/s, target %d -> %d ms",
+                block["block_id"], rate, carried, slot_ms, new_ms,
+            )
+    return blocks
 
 
 def _join_text(parts: list[dict[str, Any]]) -> str:
@@ -236,7 +362,8 @@ def load_blocks(job_dir: Path) -> list[dict[str, Any]]:
     return [b for b in data if isinstance(b, dict) and b.get("block_id")]
 
 
-def run_blocks(job_dir: Path, job: dict | None = None, **kwargs: Any) -> list[dict[str, Any]]:
+def run_blocks(job_dir: Path, job: dict | None = None, *, smooth_rates: bool = True,
+               **kwargs: Any) -> list[dict[str, Any]]:
     """Build `segments/blocks.json` from the translated cues."""
     seg_path = job_dir / "segments" / "segments.json"
     segments = json.loads(seg_path.read_text(encoding="utf-8"))
@@ -244,6 +371,9 @@ def run_blocks(job_dir: Path, job: dict | None = None, **kwargs: Any) -> list[di
         segments = segments.get("segments", [])
 
     blocks = group_blocks(segments, **kwargs)
+    if smooth_rates:
+        total_s = float(job.get("duration_s") or 0.0) if job else 0.0
+        smooth_block_rates(blocks, total_s=total_s or None)
     stamp_segments(segments, blocks)
 
     solo = [s.get("segment_id") for s in segments if s.get("block_role") == "solo"]
